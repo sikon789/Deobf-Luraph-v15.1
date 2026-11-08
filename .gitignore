@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+P*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 输出
+output*.lua
+反混淆化*.lua
+deobfuscated*.lua
+
+# 日志
+*.log
+
+# GitHub
+.github/
