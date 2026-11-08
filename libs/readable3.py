@@ -56,13 +56,7 @@ def split_exprs(toks, start, end):
                 out.append((cur, k))
                 cur = k + 1
     out.append((cur, end))
-    # 添加清理标记
     return out
-
-def cleanup_blocks(toks):
-    # 移除 Luraph V15.1 框架残留
-    # 保留业务逻辑，移除 handler 方法定义和死代码
-    pass
 
 
 def expr_end(toks, k, n):
@@ -330,13 +324,7 @@ def rename(toks):
         if tt == 'w' and vv in RESERVED:
             out[idx2] = ('w', vv)
 
-    # 添加清理标记
     return out
-
-def cleanup_blocks(toks):
-    # 移除 Luraph V15.1 框架残留
-    # 保留业务逻辑，移除 handler 方法定义和死代码
-    pass
 
 
 def v_name(toks, idx):
