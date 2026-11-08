@@ -30,6 +30,7 @@ import os
 import re
 import json
 import shutil
+import tempfile
 import argparse
 import subprocess
 import platform
@@ -107,10 +108,51 @@ def strip_luraph_vm(src):
     return best.read_text(encoding="utf-8", errors="ignore"), log.strip().split("\n")[-1]
 
 
+# 已知的 Luraph 产物语法瑕疵：少一个 end。
+# 修补是纯文本层面的，不改变语义 —— 缺的 end 本来就该在那里。
+KNOWN_SYNTAX_FIXES = [
+    ('else y=0;end;end return function() end end,Ty=function',
+     'else y=0;end;end end return function() end end,Ty=function'),
+]
+
+
+def repair_syntax(src):
+    """返回 (修补后的源码, 是否改动过)"""
+    changed = False
+    for bad, good in KNOWN_SYNTAX_FIXES:
+        if bad in src:
+            src = src.replace(bad, good, 1)
+            changed = True
+    return src, changed
+
+
+def strip_html_wrapper(src):
+    """从 HTML 里抽出真正的 Lua 代码。
+    这类样本是把 Luraph 产物整段塞进 <body>，行数少但某一行极长。"""
+    head = src[:600].lower()
+    if "<html" not in head and "<!doctype" not in head and "<body" not in head:
+        return None
+    lines = src.split("\n")
+    if not lines:
+        return None
+    # 最长的那一行就是脚本
+    code = max(lines, key=len)
+    if len(code) < 1000:
+        return None
+    return code
+
+
 def unwrap_shell(src, depth=0):
     """递归剥壳，最多 3 层"""
     if depth > 3:
         return src, depth
+    # 先剥 HTML 外壳（用户常把脚本包在 .html 里发过来）
+    inner_html = strip_html_wrapper(src)
+    if inner_html and len(inner_html) > 1000:
+        fixed, ch = repair_syntax(inner_html)
+        if ch:
+            print("     ↳ 修补已知语法瑕疵（缺 1 个 end）")
+        return unwrap_shell(fixed, depth + 1)
     for fn in (strip_decimal_shell, strip_base64_shell):
         inner = fn(src)
         if inner and len(inner) > 1000:
@@ -195,6 +237,40 @@ def ensure_executable(path):
     except OSError:
         pass
     return False
+
+
+def try_dynamic_lift(inp_path, args):
+    """形态 B：走动态路径，截获字节码 → 反编译 → 返回输出路径"""
+    try:
+        sys.path.insert(0, str(HERE))
+        import dynlift
+    except Exception as e:
+        print(f"     ✗ 动态模块不可用：{e}")
+        return None
+
+    bc = dynlift.extract_bc(str(inp_path))
+    if not bc:
+        return None
+
+    tmp = Path(tempfile.mkdtemp(prefix="lv151_bc_")) / "payload.bin"
+    tmp.write_bytes(bc)
+
+    stem = Path(inp_path).stem
+    out = (Path(args.output).parent if args.output else Path(".")) / f"{stem}_源码.luau"
+
+    print(f"     交给反编译器（Tovek）…")
+    r = subprocess.run([sys.executable, str(HERE / "lift.py"),
+                        str(tmp), str(out)],
+                       capture_output=True, text=True, timeout=900)
+    tail = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode != 0:
+        print("     ✗ " + tail.split("\n")[-1][:150])
+        return None
+    if not out.is_file():
+        return None
+    n = out.read_text(encoding="utf-8", errors="ignore").count("\n") + 1
+    print(f"     ✓ {out.stat().st_size:,} 字节  {n:,} 行")
+    return out
 
 
 def find_luau_runtime():
@@ -351,6 +427,7 @@ def main():
     ap.add_argument("--min-size", type=int, default=20000, help="最小函数长度（字节），默认 20000")
     ap.add_argument("--list", action="store_true", help="只列出大函数，不输出")
     ap.add_argument("--no-rename", action="store_true", help="不做语义重命名")
+    ap.add_argument("--no-lift", action="store_true", help="不尝试动态反编译（形态 B 时跳过）")
     ap.add_argument("--force", action="store_true", help="即使判定为 VM 字节码，也强制导出骨架")
     args = ap.parse_args()
 
@@ -477,7 +554,16 @@ def main():
 
     if not sized:
         print("[!] 没有找到大函数。可能不是 Luraph v15.1，或业务代码被编译进字节码。")
-        return 2
+        if not args.force:
+            print("    加 --force 可导出最佳猜测的骨架（跳过大小阈值）。")
+            return 2
+        # --force：阈值降到 0，把所有函数都当候选
+        print("    --force 已指定，跳过大小阈值，重新收集候选…")
+        sized = [(s, e, n) for s, e, n in outer if n > 0]
+        if not sized:
+            print("[✗] 连非空函数都没有，这个文件不像是 Luraph v15.1 产物。")
+            return 2
+        print(f"    收集到 {len(sized)} 个函数（不再限制大小）")
 
     if args.list:
         return 0
@@ -486,16 +572,23 @@ def main():
     import re as _re
     region = "".join(src[s:e + 1] for s, e, n in sized)
     # 业务特征：可读的 Roblox API / UI / 功能名字符串
+    # 只看结构化信号（真实 API 调用），不看字符串。
+    # 原因：随机标识符形如 "YmhpVeGpVQ" 全大写开头+无空格+长度 11，
+    # 会被 [A-Z][A-Za-z ]{8,} 大量误判成 UI 文案（实测 4,421 个）；
+    # 而 demo2 里 74.7% 的长字符串其实是明文 Lua 片段（反篡改自检），
+    # 一旦要求「含空格」反而得分暴涨到 4,362。两侧都不安全 → 整段移除。
     signals = {
         "GetService": len(_re.findall(r'GetService', region)),
         "Instance.new": len(_re.findall(r'Instance\s*[.:]\s*new', region)),
         "UDim2": len(_re.findall(r'UDim2', region)),
         "Color3": len(_re.findall(r'Color3', region)),
         "TweenService": len(_re.findall(r'TweenService', region)),
-        "可读中文/英文提示": len(_re.findall(r'"[A-Z][A-Za-z ]{8,}"', region)),
-        "功能名(含空格)": len(_re.findall(r'"(?:Auto|Farm|Toggle|Config|Save|Load)\s', region)),
     }
-    score = sum(v for k, v in signals.items() if k != "可读中文/英文提示") + signals["可读中文/英文提示"] // 20
+    # 不做任何字符串信号。
+    # 实测：要求「含空格」会命中 demo2 的明文 Lua 片段（" end local ttisstring = ..."），
+    # 要求「全大写无空格」会命中随机标识符（"YmhpVeGpVQ"）。
+    # 两条路都不可靠 → 只用对 VM 字节码不可能出现的 API 结构名。
+    score = sum(signals.values())
     print("[5b] 业务特征扫描：")
     for k, v in signals.items():
         print(f"      {k:<22} {v}")
@@ -503,22 +596,50 @@ def main():
 
     if score < 5:
         print()
-        print("═" * 60)
-        print("  ⚠ 此样本的业务代码已编译进 VM 字节码")
-        print("═" * 60)
-        print("  检测结果：大函数存在，但内部全是 VM 寄存器操作")
-        print("            （形如 arg[1201](11, 122)），没有任何可读的业务 API 调用。")
-        print("  说明：Luraph v15.1 把这部分代码编译成了 Luau 字节码。")
-        print("        本工具只做「提取明文业务代码」，不做字节码反编译。")
-        print("  能做的：")
-        print("    · 输出 handler 映射表（VM 索引 → math.random 这类）")
-        print("    · 输出函数结构骨架（不含业务逻辑）")
-        print("  不能做的：")
-        print("    · 还原成原始可运行的 Lua 业务源码")
-        print("═" * 60)
+        print("═" * 64)
+        print("  ⚠ 业务代码已编译进 VM 字节码（静态提取拿不到源码）")
+        print("═" * 64)
+        print("  大函数内部全是 VM 寄存器操作，没有可读的业务 API 调用。")
+        print("  静态路径到此为止 —— 但字节码本身是可解的。")
+        print("═" * 64)
+        print()
+
+        if args.no_lift:
+            print("  --no-lift 已指定，跳过动态反编译。")
+            return 4
+
+        # 动态路径：加载桩环境 → hook luau_load → 反编译
+        # 反编译器可能还没下载，先确保就位
+        lifter = HERE / "tools" / "luau-lifter"
+        if not lifter.is_file():
+            print("[6b] 反编译器未就位，尝试自动获取…")
+            try:
+                r = subprocess.run([sys.executable, str(HERE / "fetch_bin.py"),
+                                    "--lifter-only"],
+                                   capture_output=True, text=True, timeout=900)
+                print((r.stdout or "").strip()[-400:], flush=True)
+            except Exception as e:
+                print(f"     ⚠ {e}")
+            if not lifter.is_file():
+                print("     ✗ 反编译器不可用，跳过动态路径")
+                print("       手动跑： python fetch_bin.py")
+                return 4
+
+        print("[6b] 尝试动态路径：在桩环境里截获字节码并反编译…")
+        print("     注意：会在隔离的本地桩环境中执行样本的 VM 加载器，")
+        print("           不联网、不接触真实 Roblox 环境。")
+        lifted = try_dynamic_lift(inp, args)
+        if lifted:
+            print(f"[✓] 已还原源码 → {lifted}")
+            return 0
+
+        print()
+        print("  动态路径未成功。可用的替代产出：")
+        print("    · handler 映射表（VM 索引 → math.random 这类）")
+        print("    · 函数结构骨架（不含业务逻辑），加 --force 导出")
         if not args.force:
             print()
-            print("  已停止输出。加 --force 仍可导出骨架（仅供分析）。")
+            print("  已停止输出。")
             return 4
         print("  --force 已指定，继续导出骨架…")
         print("")

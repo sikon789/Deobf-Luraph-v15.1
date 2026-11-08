@@ -23,6 +23,8 @@ HERE = Path(__file__).resolve().parent
 BIN = HERE / "bin"
 OUT = HERE / "out_release"
 REPO = "sikon789/Deobf-Luraph-v15.1"
+LIFTER_ASSET = "luau-lifter.aarch64"
+GLIBC_ASSET = "glibc-aarch64.tar.gz"
 
 
 def elf_arch(path):
@@ -67,6 +69,29 @@ def main():
         sz = dest.stat().st_size
         total += sz
         print(f"[生成] {dest.name:<22} {sz:>12,} 字节  ({arch})")
+
+    # 反编译器与 glibc 也要一起上传（形态 B 出可读源码必需）
+    lifter = HERE / "tools" / "luau-lifter"
+    if lifter.is_file():
+        dest = OUT / LIFTER_ASSET
+        shutil.copy2(lifter, dest)
+        total += dest.stat().st_size
+        print(f"[生成] {dest.name:<22} {dest.stat().st_size:>12,} 字节  (aarch64)")
+    else:
+        print(f"[跳过] 没有 tools/luau-lifter（形态 B 将只能出骨架）")
+
+    gdir = HERE / "tools" / "glibc"
+    if gdir.is_dir() and any(gdir.iterdir()):
+        import tarfile
+        dest = OUT / GLIBC_ASSET
+        with tarfile.open(dest, "w:gz") as tf:
+            for f in gdir.iterdir():
+                if f.is_file() and f.name.startswith(("ld-", "libc.so", "libm.so", "ld.so")):
+                    tf.add(f, arcname=f.name)
+        total += dest.stat().st_size
+        print(f"[生成] {dest.name:<22} {dest.stat().st_size:>12,} 字节  (glibc loader)")
+    else:
+        print(f"[跳过] 没有 tools/glibc（Debian/Ubuntu 用户不需要）")
 
     print(f"\n[汇总] {len(list(OUT.iterdir()))} 个文件，共 {total:,} 字节")
     print(f"[位置] {OUT}\n")

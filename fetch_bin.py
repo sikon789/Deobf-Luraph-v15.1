@@ -36,6 +36,11 @@ TAG = "v1.3.0"
 # 文件清单：仓库内名字 → (Release 附件名)
 ARTIFACTS = ["luau", "luau-ast"]
 
+# 反编译器（形态 B 用）：luau-lifter + glibc loader
+# 单独处理，因为它不是 ELF 架构校验能覆盖的（luau-lifter 要 glibc 跑）
+LIFTER_ASSET = "luau-lifter.aarch64"
+GLIBC_ASSET = "glibc-aarch64.tar.gz"
+
 # 默认镜像（内地直连 GitHub 常超时）
 DEFAULT_MIRRORS = [
     "https://ghproxy.net/https://github.com/{repo}/releases/download/{tag}/{name}",
@@ -185,6 +190,74 @@ def fetch(name, force=False, custom_url=None):
     return None
 
 
+def ensure_lifter(force=False, custom_url=None):
+    """确保反编译器（luau-lifter + glibc）就位。
+    这是形态 B 出可读源码的必要条件，缺了就只能出骨架。"""
+    tools = HERE / "tools"
+    lifter = tools / "luau-lifter"
+    glibc = tools / "glibc"
+
+    def loader_ok():
+        return any((glibc / n).is_file() for n in
+                   ("ld-linux-aarch64.so.1", "ld.so"))
+
+    if not force and lifter.is_file() and loader_ok():
+        say("缓存", f"反编译器已就绪 → tools/luau-lifter（{lifter.stat().st_size:,} 字节）")
+        return True
+
+    if not shutil.which("curl"):
+        say("警告", "没有 curl，跳过反编译器获取")
+        return False
+
+    tools.mkdir(exist_ok=True)
+    ok_all = True
+    for asset, target in ((LIFTER_ASSET, lifter),
+                          (GLIBC_ASSET, tools / GLIBC_ASSET)):
+        if not force and target.exists() and target.stat().st_size > 50000:
+            continue
+        got = False
+        if custom_url:
+            cands = [custom_url.rstrip("/") + "/" + asset]
+        else:
+            env = os.environ.get("LUAU_BIN_URL")
+            cands = ([env.rstrip("/") + "/" + asset] if env else
+                     [t.format(repo=REPO, tag=TAG, name=asset) for t in DEFAULT_MIRRORS])
+        for url in cands:
+            say("下载", f"{asset}…")
+            r = subprocess.run(["curl", "-fsSL", "--max-time", "600",
+                                "--retry", "2", "-o", str(target), url],
+                               capture_output=True, text=True)
+            if r.returncode == 0 and target.exists() and target.stat().st_size > 50000:
+                got = True
+                break
+            say("失败", (r.stderr or "").strip().split("\n")[-1][:70])
+        if not got:
+            ok_all = False
+            continue
+
+    if (tools / GLIBC_ASSET).exists():
+        glibc.mkdir(exist_ok=True)
+        subprocess.run(["tar", "-xzf", str(tools / GLIBC_ASSET),
+                        "-C", str(glibc)], check=False)
+        (tools / GLIBC_ASSET).unlink(missing_ok=True)
+
+    if lifter.is_file():
+        lifter.chmod(0o755)
+    if lifter.is_file() and loader_ok():
+        say("完成", f"反编译器就绪（{lifter.stat().st_size:,} 字节）")
+        return True
+
+    say("警告", "反编译器未就绪 —— 形态 B 将只能输出 handler 表和骨架")
+    print("""
+  手动补法（任一）：
+    1) 从 https://github.com/Kiet1308/Tovek/releases 取
+       Tovek-V2.7-linux-aarch64.tar.gz，解出 luau-lifter 放到 tools/
+    2) glibc（Alpine 跑 glibc 程序必需，Debian/Ubuntu 系统上不用，
+       脚本会自动用系统 loader）
+""", flush=True)
+    return ok_all
+
+
 def main():
     name_arg = [a for a in sys.argv[1:] if not a.startswith("-")]
     force = "--force" in sys.argv
@@ -192,6 +265,10 @@ def main():
     for i, a in enumerate(sys.argv):
         if a == "--url" and i + 1 < len(sys.argv):
             custom = sys.argv[i + 1]
+
+    if "--lifter-only" in sys.argv:
+        say("平台", f"{platform.machine()} → {arch_suffix()}")
+        return 0 if ensure_lifter(force="--force" in sys.argv) else 1
 
     targets = [name_arg[0]] if name_arg and name_arg[0] in ARTIFACTS else ARTIFACTS
 
@@ -213,6 +290,8 @@ def main():
     for n in targets:
         if not fetch(n, force=force, custom_url=custom):
             ok_all = False
+    if "--no-lifter" not in sys.argv:
+        ensure_lifter(force=force, custom_url=custom)
     return 0 if ok_all else 1
 
 

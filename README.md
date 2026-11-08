@@ -140,9 +140,13 @@ end
 ```
 luraph_v151/
 ├── deob.py              主程序
-├── bin/
-│   ├── luau             Luau 运行时（语法验证）
-│   └── luau-ast         AST 解析器（定位字节区间）
+├── fetch_bin.py         按需下载二进制（首次运行自动调用）
+├── build_x86.py         自己编译（没网 / 要 x86_64 时用）
+├── bin/                 运行时生成，不进仓库
+│   ├── luau.aarch64
+│   ├── luau-ast.aarch64
+│   ├── luau.x86_64
+│   └── luau-ast.x86_64
 ├── libs/
 │   ├── deobf_plus.py    词法器（支持 0b/0x/下划线/转义）
 │   ├── beautify2.py     基础排版
@@ -150,16 +154,55 @@ luraph_v151/
 ├── fastsolve.py         剥壳执行器
 ├── mkfast.py            剥壳探针生成
 ├── bufemu.lua           buffer 模拟
-├── examples/
-│   ├── SAE_layer3_示例.lua          形态 A 示例
-│   └── 数字字面量变体_示例.txt       形态 B 示例
+├── robstub.lua          Roblox 环境桩
+├── examples/            示例样本（从 Release 下载）
 └── README.md
 ```
 
-## 六、环境
+## 六、环境与安装
 
 Python 3.8+，无第三方依赖。
-`bin/luau` 和 `bin/luau-ast` 是 aarch64 版本，其他架构请自行替换。
+
+### 二进制不进仓库，首次运行自动获取
+
+仓库里**没有任何二进制**（只有约 100 KB 代码）。`bin/` 下的 luau / luau-ast
+在第一次运行时由 `fetch_bin.py` 从 GitHub Release 下载，之后一直走本地缓存：
+
+```
+[1] 读取：sample.lua  948,746 字节
+[1b] 检查解析器（luau-ast / luau）…
+     本地没有可用的 luau-ast，正在从 GitHub Release 获取…
+[下载] https://ghproxy.net/https://github.com/…  ✓ 6,711,744 字节
+     ✓ luau-ast  luau-ast.aarch64  6,711,744 字节
+```
+
+想提前装好、或者网络受限，可以手动跑：
+
+```bash
+python fetch_bin.py            # 下载当前架构所需二进制
+python fetch_bin.py --check    # 只看有什么、缺什么
+python fetch_bin.py --force    # 强制重下
+python fetch_bin.py --url https://你的镜像/luau   # 自定义源
+```
+
+支持的环境变量：
+
+| 变量 | 作用 |
+|------|------|
+| `LUAU_BIN_URL` | 覆盖下载源前缀（自建服务器 / 网盘直链目录） |
+| `LUAU_BIN_MIRROR` | 镜像前缀，默认走 `ghproxy.net` 中转 |
+
+下载失败时脚本会给出三条替代路线（换镜像手动 curl、装官方包、自己编译），
+不会只丢一个报错就结束。
+
+### 自己编译
+
+```bash
+python build_x86.py            # 自动装工具链 + 依赖 + 编译
+python build_x86.py --check    # 只看现有二进制架构
+```
+
+编译产物放在 `bin/` 下，已被 `.gitignore` 排除。
 
 ## 七、能力边界（请务必读）
 
