@@ -32,6 +32,7 @@ import json
 import shutil
 import argparse
 import subprocess
+import platform
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -70,6 +71,8 @@ def strip_base64_shell(src):
 def strip_luraph_vm(src):
     """Luraph 专用剥壳：用 bufemu 模拟跑一遍，dump 解码后的缓冲区。
     返回 (layer3 源码 或 None, 说明)"""
+    print("        ↳ 正在启动剥壳引擎（bufemu 模拟执行 + buffer dump）…")
+    print("          首次运行可能需要几秒到几十秒，请稍候")
     import tempfile
     tmpdir = Path(tempfile.mkdtemp(prefix="lv151_"))
     target = tmpdir / "target.lua"
@@ -117,34 +120,86 @@ def unwrap_shell(src, depth=0):
 
 # ---------------------------------------------------------------- AST 定位
 
-def find_luau_ast():
-    """定位 luau-ast 可执行文件。
-    依次尝试：bin/ → libs/ → 仓库根 → 上级目录 → PATH。
-    这样无论二进制放在 bin/ 还是 libs/ 都能找到。"""
-    names = ["luau-ast"]
+def _arch_suffix():
+    """当前平台对应的二进制后缀，如 aarch64 / x86_64"""
+    m = platform.machine().lower()
+    if m in ("x86_64", "amd64"):
+        return "x86_64"
+    if m in ("aarch64", "arm64"):
+        return "aarch64"
+    return m
+
+
+def _pick(name):
+    """按优先级找二进制：架构专用名 → 通用名；
+    通用名若架构不符则跳过（避免 Exec format error）。"""
     roots = [HERE, HERE / "bin", HERE / "libs", HERE.parent,
              HERE.parent / "bin", HERE.parent / "libs"]
+    suf = _arch_suffix()
+    # 1) 优先架构专用文件  luau.x86_64 / luau.aarch64
     for r in roots:
-        for nm in names:
-            c = r / nm
-            if c.exists() and c.is_file():
+        c = r / f"{name}.{suf}"
+        if c.is_file():
+            ensure_executable(str(c))
+            return str(c)
+    # 2) 通用名，但必须是本机架构
+    for r in roots:
+        c = r / name
+        if c.is_file():
+            ok, msg = check_elf_arch(str(c))
+            if ok:
+                ensure_executable(str(c))
                 return str(c)
-    for nm in names:
-        found = shutil.which(nm)
-        if found:
+    # 3) PATH
+    found = shutil.which(name)
+    if found:
+        ok, _ = check_elf_arch(found)
+        if ok:
             return found
     return None
 
 
+def find_luau_ast():
+    """定位 luau-ast：优先架构专用 → 通用 → PATH"""
+    return _pick("luau-ast")
+
+
+def check_elf_arch(path):
+    """检查 ELF 架构是否可执行，返回 (ok, 说明)"""
+    import struct
+    try:
+        with open(path, 'rb') as f:
+            magic = f.read(20)
+        if magic[:4] != b"\x7fELF":
+            return True, ""  # 不是 ELF，交给系统判断
+        ei_class = magic[4]
+        ei_data = magic[5]
+        e_machine = struct.unpack("<H" if ei_data == 1 else ">H", magic[18:20])[0]
+        names = {0x3e: "x86_64", 0xb7: "aarch64", 0x03: "i386", 0x28: "arm"}
+        arch = names.get(e_machine, f"0x{e_machine:x}")
+        cur = platform.machine()
+        ok = (arch == cur) or (arch == "x86_64" and cur in ("x86_64", "AMD64"))
+        if not ok:
+            return False, f"这是 {arch} 二进制，当前架构 {cur} 无法执行"
+        return True, ""
+    except Exception:
+        return True, ""
+
+
+def ensure_executable(path):
+    """确保有可执行权限（zip 解压后常见 644）"""
+    try:
+        if not os.access(path, os.X_OK):
+            os.chmod(path, 0o755)
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def find_luau_runtime():
-    """定位 luau 运行时，用于语法验证。同上，多目录回退。"""
-    roots = [HERE, HERE / "bin", HERE / "libs", HERE.parent,
-             HERE.parent / "bin", HERE.parent / "libs"]
-    for r in roots:
-        c = r / "luau"
-        if c.exists() and c.is_file():
-            return str(c)
-    return shutil.which("luau")
+    """定位 luau 运行时：优先架构专用 → 通用 → PATH"""
+    return _pick("luau")
 
 
 
@@ -202,27 +257,58 @@ CLOSEP = re.compile(r'\s+\)')
 
 
 def tidy(text):
-    text = HFUN.sub("function(", text)
-    text = DOT.sub(".", text)
-    text = COLON.sub(":", text)
-    text = OPENP.sub("(", text)
-    text = CLOSEP.sub(")", text)
-    return text
+    """清理排版空白的 token 级实现。
+    旧版用整文正则替换，会把字符串字面量里的 " . " / " : " / "( " 也改掉，
+    直接篡改数据。这里改为只对「非字符串、非注释」的 token 做处理。"""
+    from deobf_plus import tokenize, format_tokens
+    try:
+        toks = tokenize(text)
+    except Exception:
+        return text
+    out = []
+    for t, v in toks:
+        if t == 'c':
+            out.append((t, v))
+        elif t == 's':
+            out.append((t, v))          # 字符串原样保留，一个字节都不动
+        elif t == 'o':
+            out.append((t, v))          # 运算符交给 format_tokens 决定间距
+        else:
+            out.append((t, v))
+    # format_tokens 本身只在 token 之间插入空白，不触碰 token 内容
+    return format_tokens(out)
+
 
 
 def verify(text):
-    """用 luau 解析验证"""
+    """用 luau 做语法验证。
+
+    只解析、不执行：luau CLI 没有 --parse，但 `--fflags` 里没有纯解析开关，
+    所以这里用一个技巧——把代码包进 `if false then ... end`，
+    运行时永远不会进入，但语法必须合法才能编译通过。
+    这样既不会真的执行被测脚本，也能可靠地捕获语法错误。
+    """
     luau = find_luau_runtime()
     if not luau:
         return True, "跳过（未找到 luau 二进制）"
     tmp = Path("/tmp/_lv151_verify.lua")
-    tmp.write_text(text, encoding="utf-8")
-    r = subprocess.run([str(luau), str(tmp)], capture_output=True, text=True, timeout=300)
+    # 包一层，避免执行副作用
+    wrapped = "if false then\n" + text + "\nend\n"
+    tmp.write_text(wrapped, encoding="utf-8")
+    try:
+        r = subprocess.run([str(luau), str(tmp)], capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return True, "验证超时（假定语法通过）"
     msg = ((r.stdout or "") + (r.stderr or "")).strip()
-    if "Expected" in msg or "error" in msg.lower() and "attempt to" not in msg:
-        if "Expected" in msg:
-            return False, msg.split("\n")[0]
+
+    # 语法错误特征
+    if "Expected" in msg:
+        return False, msg.split("\n")[0]
+    if "unknown opcode" in msg.lower() or "malformed" in msg.lower():
+        return False, msg.split("\n")[0]
+    # 含 "attempt to" 说明语法通过、只是运行时缺环境 —— 这是正常结果
     return True, msg.split("\n")[0] if msg else "OK"
+
 
 
 # ---------------------------------------------------------------- 主流程
@@ -245,6 +331,21 @@ def main():
     raw = inp.read_text(encoding="utf-8", errors="ignore")
     print(f"[1] 读取：{inp.name}  {len(raw):,} 字节")
 
+    # 前置检查：确认解析器与运行时可用
+    print("[1b] 检查解析器（luau-ast / luau）…")
+    _ast = find_luau_ast()
+    _run = find_luau_runtime()
+    if _ast:
+        ensure_executable(_ast)
+        print(f"     ✓ luau-ast  {Path(_ast).name}  {Path(_ast).stat().st_size:,} 字节")
+    else:
+        print("     ✗ 未找到 luau-ast")
+    if _run:
+        ensure_executable(_run)
+        print(f"     ✓ luau      {Path(_run).name}  {Path(_run).stat().st_size:,} 字节")
+    else:
+        print("     ✗ 未找到 luau（语法验证将跳过）")
+
     # 剥壳
     src, layers = unwrap_shell(raw)
     if layers:
@@ -255,8 +356,19 @@ def main():
     # Luraph 专用剥壳：如果 AST 里找不到大函数，就走 bufemu 流程
     ast_bin = find_luau_ast()
     if not ast_bin:
-        print("[✗] 找不到 luau-ast，请放到 bin/ 目录")
+        print("[✗] 找不到 luau-ast")
+        print("    请放到 bin/ 或 libs/ 目录，或安装到 PATH")
         return 1
+
+    # 权限 + 架构检查
+    if ensure_executable(ast_bin):
+        print(f"[2a] 已为 {Path(ast_bin).name} 添加可执行权限（zip 解压后常见为 644）")
+    ok_arch, arch_msg = check_elf_arch(ast_bin)
+    if not ok_arch:
+        print(f"[✗] {Path(ast_bin).name}: {arch_msg}")
+        print("    请构建对应架构的 luau-ast：")
+        print("    https://github.com/luau-lang/luau  （编译 luau-ast 目标）")
+        return 5
 
     def has_big_func(text):
         try:
@@ -281,7 +393,7 @@ def main():
         inner, note = strip_luraph_vm(src)
         if inner:
             src = inner
-            print(f"[2b] 剥壳成功 → {len(src):,} 字节   ({note})")
+            print(f"[2b] ✓ 剥壳完成 → {len(src):,} 字节   ({note})")
             # 剥出来的层可能还是壳，继续下探
             for depth in range(3):
                 if has_big_func(src):

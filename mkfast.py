@@ -4,17 +4,39 @@
 可选叠加 Roblox 万能桩，跑完后 dump 所有 buffer（hex）——绕过符号执行直接拿解码结果。
 """
 import sys
+import os
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# 多路径回退：脚本同级 → 上级 → 上上级
+def _find(fname):
+    for root in (HERE, os.path.dirname(HERE), os.path.dirname(os.path.dirname(HERE))):
+        p = os.path.join(root, fname)
+        if os.path.isfile(p):
+            return p
+    return None
 
 args = [a for a in sys.argv[1:] if not a.startswith('--')]
 stub = '--stub' in sys.argv
+if len(args) < 2:
+    sys.stderr.write('用法: mkfast.py <target.lua> <out_runner.lua> [minlen] [--stub]\n')
+    sys.exit(2)
 src_path, out_path = args[0], args[1]
 minlen = args[2] if len(args) > 2 else "512"
 
 src = open(src_path, 'rb').read().decode('utf-8', 'replace')
-emu = open('/var/minis/workspace/bufemu.lua', 'r', encoding='utf-8').read().replace('return BE', '')
+
+emu_path = _find('bufemu.lua')
+if not emu_path:
+    sys.stderr.write('[mkfast] 找不到 bufemu.lua（应在脚本目录或其上级）\n')
+    sys.exit(3)
+emu = open(emu_path, 'r', encoding='utf-8').read().replace('return BE', '')
+
 stub_src = ''
 if stub:
-    stub_src = "(function()\n" + open('/var/minis/workspace/robstub.lua', 'r', encoding='utf-8').read() + "\nend)()"
+    stub_path = _find('robstub.lua')
+    if stub_path:
+        stub_src = "(function()\n" + open(stub_path, 'r', encoding='utf-8').read() + "\nend)()"
 
 edge, n = '', 0
 while ('[' + edge + '[') in src or (']' + edge + ']') in src:
@@ -48,9 +70,11 @@ local ENV = setmetatable({ buffer = BE, print = realprint, warn = realprint }, {
   end
 })
 local ok, err = xpcall(function()
-  local chunk = loadstring(SRC, "=target")
-  if not chunk then error("loadstring failed") end
-  setfenv(chunk, ENV)
+  local loader = loadstring or load
+  local setter = setfenv or function(f) return f end
+  local chunk, lerr = loader(SRC, "=target")
+  if not chunk then error("load failed: " .. tostring(lerr)) end
+  setter(chunk, ENV)
   local r = chunk()
   if type(r) == "function" then r() end
 end, function(e) return tostring(e) .. string.char(10) .. debug.traceback("", 2) end)

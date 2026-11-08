@@ -8,7 +8,34 @@
 import os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LUAU = os.path.join(HERE, 'luraph151_c', 'bin', 'luau')
+
+
+def _find_luau():
+    """多路径回退找 luau 运行时"""
+    cands = [
+        os.path.join(HERE, 'bin', 'luau'),
+        os.path.join(HERE, 'libs', 'luau'),
+        os.path.join(HERE, 'luau'),
+        os.path.join(HERE, 'luraph151_c', 'bin', 'luau'),
+        os.path.join(os.path.dirname(HERE), 'bin', 'luau'),
+        os.path.join(os.path.dirname(HERE), 'libs', 'luau'),
+    ]
+    for c in cands:
+        if os.path.isfile(c):
+            if not os.access(c, os.X_OK):
+                try:
+                    os.chmod(c, 0o755)
+                except OSError:
+                    pass
+            return c
+    import shutil as _sh
+    return _sh.which('luau')
+
+
+LUAU = _find_luau()
+if not LUAU:
+    sys.stderr.write('[fastsolve] 找不到 luau 运行时，请放到 bin/ 或 libs/\n')
+    sys.exit(3)
 
 def run_capture(target, workdir, stub=False, minlen=48):
     runner = os.path.join(workdir, '_runner.lua')
