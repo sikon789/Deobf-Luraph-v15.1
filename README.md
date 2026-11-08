@@ -151,12 +151,47 @@ luraph_v151/
 │   ├── deobf_plus.py    词法器（支持 0b/0x/下划线/转义）
 │   ├── beautify2.py     基础排版
 │   └── readable3.py     语义重命名
+├── dynlift.py           形态 B：动态截获 Luau 字节码
+├── lift.py              封装的反编译器（Tovek）
 ├── fastsolve.py         剥壳执行器
 ├── mkfast.py            剥壳探针生成
 ├── bufemu.lua           buffer 模拟
 ├── robstub.lua          Roblox 环境桩
+├── readability.py       可读性量化打分（对比两份产物）
+├── report.py            多产物横向对比表
+├── pretty.py            反汇编整理成人能读的形式
+├── pack.sh              安全打包（不动工作目录）
+├── tools/               反编译器，运行时生成，不进仓库
+│   ├── luau-lifter
+│   └── glibc/
 ├── examples/            示例样本（从 Release 下载）
 └── README.md
+```
+
+### 附加工具
+
+**可读性打分** —— 判断一份反混淆产物到底能不能用：
+
+```bash
+python readability.py 旧产物.lua 新产物.luau
+```
+
+7 个维度：语法可解析 30 / 语句密度 15 / 命名质量 15 / 缩进 10 /
+无噪音 5 / **逻辑完整度 20** / 业务文案 5。
+
+其中「逻辑完整度」权重最高——统计有多少函数体是空的、被标注 `⚠ 未记录`。
+一份看着漂亮的产物如果丢了一半逻辑，这一项会直接暴露。
+
+**多产物对比**：
+
+```bash
+python report.py a.lua b.lua c.luau
+```
+
+**反汇编整理**（形态 B 的中间产物，不想要源码只要结构时用）：
+
+```bash
+python pretty.py dump.txt 输出.txt
 ```
 
 ## 六、环境与安装
