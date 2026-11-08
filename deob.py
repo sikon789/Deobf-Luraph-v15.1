@@ -36,6 +36,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "libs"))
+sys.path.insert(0, str(HERE))  # deobf_plus 可能在根目录
 
 # ---------------------------------------------------------------- 外层壳剥离
 
@@ -117,17 +118,34 @@ def unwrap_shell(src, depth=0):
 # ---------------------------------------------------------------- AST 定位
 
 def find_luau_ast():
-    """定位 luau-ast 可执行文件"""
-    cands = [
-        HERE / "bin" / "luau-ast",
-        HERE / "bin" / "luau",
-        Path("/var/minis/workspace/luraph151_c/bin/luau-ast"),
-    ]
-    for c in cands:
-        if c.exists() and c.name == "luau-ast":
+    """定位 luau-ast 可执行文件。
+    依次尝试：bin/ → libs/ → 仓库根 → 上级目录 → PATH。
+    这样无论二进制放在 bin/ 还是 libs/ 都能找到。"""
+    names = ["luau-ast"]
+    roots = [HERE, HERE / "bin", HERE / "libs", HERE.parent,
+             HERE.parent / "bin", HERE.parent / "libs"]
+    for r in roots:
+        for nm in names:
+            c = r / nm
+            if c.exists() and c.is_file():
+                return str(c)
+    for nm in names:
+        found = shutil.which(nm)
+        if found:
+            return found
+    return None
+
+
+def find_luau_runtime():
+    """定位 luau 运行时，用于语法验证。同上，多目录回退。"""
+    roots = [HERE, HERE / "bin", HERE / "libs", HERE.parent,
+             HERE.parent / "bin", HERE.parent / "libs"]
+    for r in roots:
+        c = r / "luau"
+        if c.exists() and c.is_file():
             return str(c)
-    found = shutil.which("luau-ast")
-    return found
+    return shutil.which("luau")
+
 
 
 def run_ast(src_text, ast_bin):
@@ -194,9 +212,9 @@ def tidy(text):
 
 def verify(text):
     """用 luau 解析验证"""
-    luau = HERE / "bin" / "luau"
-    if not luau.exists():
-        return True, "跳过（无 luau 二进制）"
+    luau = find_luau_runtime()
+    if not luau:
+        return True, "跳过（未找到 luau 二进制）"
     tmp = Path("/tmp/_lv151_verify.lua")
     tmp.write_text(text, encoding="utf-8")
     r = subprocess.run([str(luau), str(tmp)], capture_output=True, text=True, timeout=300)
