@@ -202,6 +202,37 @@ def find_luau_runtime():
     return _pick("luau")
 
 
+def _autofetch(name, quiet=False):
+    """本地没有可用二进制时，调 fetch_bin.py 从 Release 下载。
+    失败不抛异常——交给上层给出「怎么补」的提示。"""
+    script = HERE / "fetch_bin.py"
+    if not script.is_file():
+        return None
+    if not quiet:
+        print(f"     本地没有可用的 {name}，正在从 GitHub Release 获取…", flush=True)
+    try:
+        r = subprocess.run([sys.executable, str(script), name],
+                           capture_output=True, text=True, timeout=900)
+        if not quiet:
+            print((r.stdout or "").rstrip(), flush=True)
+        if r.returncode == 0:
+            return _pick(name)
+        if not quiet:
+            print((r.stderr or "").rstrip(), flush=True)
+    except Exception as e:
+        if not quiet:
+            print(f"     ⚠ 自动获取失败：{e}", flush=True)
+    return None
+
+
+def find_luau_ast_or_fetch(quiet=False):
+    return find_luau_ast() or _autofetch("luau-ast", quiet)
+
+
+def find_luau_runtime_or_fetch(quiet=False):
+    return find_luau_runtime() or _autofetch("luau", quiet)
+
+
 
 def run_ast(src_text, ast_bin):
     """跑 luau-ast，返回 JSON"""
@@ -288,7 +319,7 @@ def verify(text):
     运行时永远不会进入，但语法必须合法才能编译通过。
     这样既不会真的执行被测脚本，也能可靠地捕获语法错误。
     """
-    luau = find_luau_runtime()
+    luau = find_luau_runtime_or_fetch(quiet=True)
     if not luau:
         return True, "跳过（未找到 luau 二进制）"
     tmp = Path("/tmp/_lv151_verify.lua")
@@ -333,8 +364,8 @@ def main():
 
     # 前置检查：确认解析器与运行时可用
     print("[1b] 检查解析器（luau-ast / luau）…")
-    _ast = find_luau_ast()
-    _run = find_luau_runtime()
+    _ast = find_luau_ast_or_fetch()
+    _run = find_luau_runtime_or_fetch(quiet=True)
     if _ast:
         ensure_executable(_ast)
         print(f"     ✓ luau-ast  {Path(_ast).name}  {Path(_ast).stat().st_size:,} 字节")
@@ -354,10 +385,11 @@ def main():
         print("[2] 未检测到简单外层壳")
 
     # Luraph 专用剥壳：如果 AST 里找不到大函数，就走 bufemu 流程
-    ast_bin = find_luau_ast()
+    ast_bin = find_luau_ast_or_fetch(quiet=True)
     if not ast_bin:
         print("[✗] 找不到 luau-ast")
-        print("    请放到 bin/ 或 libs/ 目录，或安装到 PATH")
+        print("    手动下载： python fetch_bin.py")
+        print("    或放到 bin/ 目录，或安装到 PATH")
         return 1
 
     # 权限 + 架构检查

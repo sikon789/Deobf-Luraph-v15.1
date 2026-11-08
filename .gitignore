@@ -1,45 +1,27 @@
+# 二进制不进仓库 —— 首次运行由 fetch_bin.py 从 Release 下载
+bin/
+*.aarch64
+*.x86_64
+*.part
+.*.part
+
+# 示例大文件（按需从 Release 取，仓库保持轻量）
+examples/*.lua
+examples/*.txt
+examples/*.bin
+!examples/README.md
+
 # Python
 __pycache__/
-*.py[cod]
-P*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# 虚拟环境
-venv/
-ENV/
-env/
-
-# IDE
-.vscode/
-.idea/
-
-# 操作系统
-.DS_Store
-Thumbs.db
+*.pyc
+*.pyo
+.pytest_cache/
 
 # 输出
-output*.lua
-反混淆化*.lua
-deobfuscated*.lua
-
-# 日志
+output.lua
+*_deobf*.lua
 *.log
 
-# GitHub
-.github/
+# 系统
+.DS_Store
+Thumbs.db
