@@ -1,213 +1,156 @@
-# Luraph v15.1 一键反混淆工具
+# Luraph v15.1 反混淆工具
 
-![版本](https://img.shields.io/badge/版本-v1.0.0-blue)
-![许可](https://img.shields.io/badge/许可-MIT-green)
-![Python](https://img.shields.io/badge/Python-3.8+-yellow)
+自动识别样本形态，能解的完整解出，不能解的明确告诉你原因 —— **不报假成功**。
 
-一个专门用于反编译 **Luraph v15.1** 保护脚本的自动化工具，可恢复完整的可读源代码。
+## 一、这个工具到底做什么
 
-## 🌟 主要特性
+Luraph v15.1 有**两种发布形态**，工具会自动判断：
 
-- ✅ **全自动反混淆** - 一键处理 Luraph v15.1 多层包装
-- ✅ **源码恢复** - 还原示业务流程和 UI 库代码
-- ✅ **中文界面** - 友好的中文命令行提示
-- ✅ **桩环境** - 内置 `Roblox` 桩环境支持验证运行
-- ✅ **开源免费** - MIT 许可，可自由使用和修改
+### 形态 A：业务代码留在明文 ✅ 完整解出
 
-## 🚀 快速开始
+Luraph 只是把代码压成一行、塞进 `setmetatable({...})` 表里，外层套个加密壳。
+代码本身**还是明文的 Lua**。
 
-### 安装
+```
+setmetatable({
+  [87] = function(...) ... 真实的 UI / 功能代码 ... end,
+  [1033] = math.random,
+  ...
+})
+```
 
-本项目无需额外安装，Python 3.8+ 即可运行：
+工具会自动：
+1. 剥外层加密壳（十进制转义 / base64 / Luraph VM 壳）
+2. 用 `luau-ast` 定位所有大函数的**精确字节区间**
+3. 按区间切出来、断行、语义重命名
+4. 提取 handler 表并加注释
+5. 用 `luau` 验证语法
+
+→ 输出完整可读源码。
+
+### 形态 B：业务代码编译进 VM 字节码 ❌ 不假装能解
+
+明文里只剩 handler 表，你的代码已经变成 Luau 字节码：
+
+```
+setmetatable({
+  [1033] = math["random"],
+  [106]  = buffer["writeu32"],
+  ...
+})
+```
+
+大函数内部全是 `arg2[1201](11, 122)` 这种寄存器操作，**一句业务代码都没有**。
+
+工具会扫描业务特征（`GetService` / `Instance.new` / `UDim2` / `Color3` / 可读字符串），
+得分过低就直接停下，告诉你：
+
+```
+════════════════════════════════════════════════════════════
+  ⚠ 此样本的业务代码已编译进 VM 字节码
+════════════════════════════════════════════════════════════
+  ...
+  已停止输出。加 --force 仍可导出骨架（仅供分析）。
+```
+
+加 `--force` 可以导出骨架 + handler 映射表，但**那不是源码**。
+
+## 二、用法
 
 ```bash
-# 克隆仓库
-git clone https://github.com/yourusername/luraph151-cn.git
-cd luraph151-cn
+# 自动判断 + 解出（形态 A）
+python deob.py 样本.lua -o 输出.lua
 
-# 检查 Python 版本
-python3 --version
+# 只看发现了哪些大函数，不输出
+python deob.py 样本.lua --list
+
+# 强制导出骨架（形态 B 分析用）
+python deob.py 样本.lua -o 骨架.lua --force
+
+# 不做语义重命名（保留原始变量名）
+python deob.py 样本.lua -o 输出.lua --no-rename
+
+# 调整大函数阈值（默认 20000 字节）
+python deob.py 样本.lua -o 输出.lua --min-size 5000
 ```
 
-### 使用
+## 三、输出长什么样
 
-#### 基础用法
+```lua
+--[[
+  Luraph v15.1 自动反混淆输出
+  源文件：样本.lua
+  共提取 4 个业务函数
+]]
 
-```bash
-python luraph_cn.py input.lua -o output.lua
+-- ============================================================
+-- handler 表（VM 索引 → 实际值）
+-- ============================================================
+-- [1033] = math.random
+-- [268]  = buffer.writef64
+-- [1156] = table.clear
+
+-- ============================================================
+-- 第 1 段  原始偏移 252393 - 944109  (691,716 字节)
+-- ============================================================
+local __part1 = function(...)
+    local Players = game:GetService("Players")
+    local TweenService = game:GetService("TweenService")
+    ...
+end
 ```
 
-#### 调试模式
+## 四、实测数据
 
-```bash
-python luraph_cn.py input.txt -o output.lua --verbose
-```
+| 样本 | 形态 | 结果 |
+|------|------|------|
+| `StealAnEggg.txt` (636 KB) | A | ✅ 43,262 行，4 个函数，103 条 handler，语法通过 |
+| 数字字面量变体 (264 KB) | B | ✅ 正确识别并拒绝输出（得分 0） |
+| CatHub (105 KB) | 非 Luraph | ✅ 提示不是 Luraph v15.1 |
 
-#### 示例
+形态 A 的业务特征得分实测 **1375**（`UDim2` 457 次、`Color3` 551 次、功能名 125 处），
+形态 B 得分 **0**，区分度极高。
 
-```bash
-# 反混淆标准文件
-python luraph_cn.py StealAnEggg.txt -o output.lua
-
-# 处理 .lua 文件
-python luraph_cn.py protected_script.lua -o deobfuscated.lua --force
-
-# 指定输出目录
-python luraph_cn.py input.lua -o ./pro_output/result.lua
-```
-
-## 📁 项目结构
+## 五、目录结构
 
 ```
-cn_deob/
-├── luraph_cn.py          # 主程序（中文界面）
-├── libs/                  # 核心库
-│   ├── beautify2.py      # 排版引擎
-│   ├── readable3.py      # 语义重命名
-│   └── mock_standalone.py # 桩环境
-├── examples/              # 示例文件
-│   ├── layer3_sample.lua   # 示例输入
-│   └── blob4.bin           # 示例 payload
-├── README_CN.md           # 本文件
-└── requirements.txt       # 依赖列表（空）
+luraph_v151/
+├── deob.py              主程序
+├── bin/
+│   ├── luau             Luau 运行时（语法验证）
+│   └── luau-ast         AST 解析器（定位字节区间）
+├── libs/
+│   ├── deobf_plus.py    词法器（支持 0b/0x/下划线/转义）
+│   ├── beautify2.py     基础排版
+│   └── readable3.py     语义重命名
+├── fastsolve.py         剥壳执行器
+├── mkfast.py            剥壳探针生成
+├── bufemu.lua           buffer 模拟
+├── examples/
+│   ├── SAE_layer3_示例.lua          形态 A 示例
+│   └── 数字字面量变体_示例.txt       形态 B 示例
+└── README.md
 ```
 
-## 🎯 技术核心
+## 六、环境
 
-### 1. 多层包装解析
-自动识别并剥离 Luraph v15.1 的 stage1、stage2、VM 层，只保留真正的业务代码。
+Python 3.8+，无第三方依赖。
+`bin/luau` 和 `bin/luau-ast` 是 aarch64 版本，其他架构请自行替换。
 
-### 2. 语义重命名
-基于作用域分析，自动恢复反混淆后的变量名：
-- `W` → `VM` (虚拟机上下文)
-- `p` → `GetService` (服务获取)
-- `k` → `opcode` (操作码)
-- `Gk` → `MemoryAccess` (内存访问)
-- `Xk` → `FunctionCall` (函数调用)
+## 七、能力边界（请务必读）
 
-### 3. 手写风格格式化
-模仿程序员在 IDE 手动排版的风格，代码易读：
-- 适当的空行分隔逻辑块
-- 关键字后紧跟空格
-- 减少嵌套层级感
+✅ **能做**
+- 剥 Luraph 外层加密壳
+- 精确定位明文业务函数（AST 字节区间，不是正则猜边界）
+- 处理 `0B110001_1_1_111`、`0X3b_D` 这类数字字面量变体
+- 解码 `\x72\x61\110`、`\u{0077}` 混合转义
+- 提取 handler 表并标注含义
+- 语法验证（luau 解析）
 
-### 4. 桩环境修复
-完整模拟 `Roblox` API：
-- `Color3`、`UDim2`、`Vector2` 等
-- `getgenv()`、`loadstring()`、`pcall()`
-- `HttpService`、`TweenService`、`Players`
+❌ **不能做**
+- 把形态 B 的 Luau 字节码反编译回 Lua 源码
+- 这需要完整的 VM 指令级反向工程，不在本工具范围内
 
-## ⚙️ 工作原理
+## 八、许可
 
-```
-原始保护脚本 (layer3.lua)
-    ↓ [反混淆引擎]
-语义重命名 (readable3)
-    ↓
-代码编辑 (beautify2)
-    ↓
-可运行源代码 (output.lua)
-```
-
-**反混淆完整流程：**
-
-1. **Token 化** - 将代码分解为基本单元
-2. **AST 构建** - 构建抽象语法树
-3. **作用域分析** - 识别变量声明和作用域
-4. **语义重命名** - 恢复变量名和函数名
-5. **风格排版** - 添加合适的空格和换行
-6. **输出验证** - 检查语法正确性
-
-## ⚠️ 注意事项
-
-- **输入文件** - 必须是 Luraph v15.1 保护的 `.lua` 或 `.txt` 文件
-- **输出文件** - 生成的 Lua 代码可以在任何执行器中运行
-- **桩限制** - 某些 Roblox API 可能被简化，个别功能可能未完全模拟
-- **仅用于学习** - 请遵守目的用途的法律法规
-
-## 📋 常见问题
-
-### Q: 工具为什么没有反应？
-A: 确认输入文件是否是 Luraph v15.1 保护。其他保护方案（如 `Luraph v15.0`）可能不兼容。
-
-### Q: 输出文件很大？
-A: 正常。反混淆后的代码包含完整的注释和样式，文件会比原始保护代码大数倍。
-
-### Q: 运行时报错？
-A: 检查桩环境是否完全模拟了需要的 API。有问题请提交 issue。
-
-## 🤝 贡献指南
-
-欢迎提交 PR！本项目的规则：
-
-1. 保持代码简洁高效
-2. 尊重原作者的 License
-3. 提供中文注释和文档
-4. 不破坏向后兼容性
-
-## 📄 许可证
-
-**MIT License**
-
-Copyright (c) 2024 Luraph151CN Contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-## 💾 下载
-
-[![GitHub Release](https://img.shields.io/badge/下载-GitHub-green)](https://github.com/yourusername/luraph151-cn/releases)
-
----
-
-*Made with ❤️ for educational purposes*
-
-## ✨ 新增功能：清理模式
-
-### `--clean` 参数
-
-从 v1.1.0 开始，支持清理模式，可以自动移除 Luraph 框架残留、调试代码和死代码，只保留核心业务逻辑。
-
-```bash
-python luraph_cn.py input.lua -o output.lua --clean
-```
-
-### 清理规则
-
-1. **移除 Handler 定义** - 删除 `[41] = function...` 等 Luraph 特有的 handler 方法
-2. **移除主分发器** - 删除 `rk = function...` 等 VM 分派器代码
-3. **移除调试死循环** - 删除包含调试功能和炸弹的 `while true do` 循环
-4. **保留业务逻辑** - 保留所有实际的业务函数和 UI 库
-
-### 使用场景
-
-- **分析研究** - 查看脚本的实际业务逻辑
-- **逆向调试** - 减少无关代码干扰
-- **学习参考** - 快速理解脚本功能
-
-### ⚠️ 注意事项
-
-启用 `--clean` 后的代码可能**无法直接运行**，因为移除了框架代码。主要适用于：
-- 代码分析
-- 功能学习
-- 逆向研究
-
-**完整反混淆版**（保留框架，可运行）请使用不带 `--clean` 的输出。
-
----
-
+MIT License
