@@ -58,16 +58,62 @@ def analyze(path):
         """形如 v3 / a12 / i5 的短名 —— 反编译器的临时寄存器命名"""
         return bool(re.fullmatch(r'[a-zA-Z]\d+', nm))
 
-    raw_names = re.findall(r'\b(arg\d+|Tab\d+|Slider\d+|Dropdown\d+|'
-                           r'Button\d+|TextBox\d+|Label\d+|fn\d+|'
-                           r'v\d+|result\d+|__part\d+|A\d+|R\d+|'
-                           r'[a-z]\d+)\b', src)
-    machine, temps = [], []
-    for nm in raw_names:
-        if is_temp(nm) and nm in declared:
-            temps.append(nm)      # 有声明 → 普通局部变量
+    # 注意排除真正的 API 名：UDim2 / Color3 / Vector2 / BackgroundColor3
+    # 这些是合法的 Roblox 类型，不能算机名
+    API_NAMES = {
+        "UDim2", "UDim", "Color3", "Vector2", "Vector3", "CFrame", "Vector2int16",
+        "Vector3int16", "Rect", "NumberSequence", "ColorSequence", "BrickColor",
+        "Font", "UDim2Scalar", "Enum",
+    }
+    # 只统计「明显是机器起名」的模式。
+    # 不统计 v123 / i26 这类 —— 它们是正常的短局部变量（循环计数器等），
+    # 统计进去会把任何代码都判成不可读。
+    # 分三档：
+    #   SEMI  —— 有语义前缀但带编号（tbl3 / fn47 / onFrame12），半可读
+    #   FULL  —— 纯编号（arg1 / v2），几乎不可读
+    SEMI_PREFIX = ('tbl', 'fn', 'rgb', 'result', 'item', 'onFrame', 'onTick',
+                   'onInput', 'draw', 'update', 'render', 'refresh', 'create',
+                   'destroy', 'tween', 'safeCall', 'setupEnv', 'saveFile',
+                   'loadFile', 'raycast', 'disconnect', 'num', 'str', 'flag',
+                   'cond', 'scale', 'offset', 'enum', 'map', 'list',
+                   'onFrame', 'onStep', 'onInputChanged', 'onInputEnded',
+                   'onClick', 'onCharacter', 'onHumanoid', 'onCamera',
+                   'onHealth', 'onKey', 'onToggle', 'onChange', 'onRelease',
+                   'onPress', 'initServices', 'process', 'handler', 'callback',
+                   'loop', 'tick', 'frame', 'updateLoop', 'conn')
+    raw_names = [n for n in re.findall(
+        r'\b([A-Za-z_]\w*\d+)\b', src) if n not in API_NAMES]
+    semi, full, unresolvable, api_suffixed = [], [], [], []
+    for nm_i in raw_names:
+        pre = nm_i.rstrip('0123456789')
+        # API 名 + 数字后缀（GetService2 / Instance_new3 / UDim2 之类）
+        # 这是重名消解，不是机器命名
+        if re.fullmatch(r'(GetService|Instance_new|Instance|FindFirstChild|'
+                        r'WaitForChild|UDim|UDim2|Color3|Color|Vector2|Vector3|'
+                        r'CFrame|pcall|pcallRes|safeCall|Add|Remove|Create|'
+                        r'Destroy|Connect|Disconnect|Tween|TweenService|'
+                        r'Enum|Drawing_new|Drawing|BackgroundColor|TextColor|'
+                        r'BackgroundTransparency|TextTransparency|Size|Position|'
+                        r'AnchorPoint|BorderSize|BorderColor|Font|TextScaled|'
+                        r'Parent|Name|Visible|Transparency|Value)\d*', nm_i):
+            api_suffixed.append(nm_i)
+        elif re.fullmatch(r'(UDim2|Color3|Vector2|Vector3|UDim|CFrame)$', pre):
+            api_suffixed.append(nm_i)
+        elif pre in SEMI_PREFIX:
+            semi.append(nm_i)
+        elif re.fullmatch(r'[A-Za-z_]+_\d+', nm_i):
+            # X_7 / tbl_7 这种「容器+下标」，是有语义的
+            semi.append(nm_i)
+        elif pre in ('arg', '__part', 'A', 'R'):
+            # VM 参数寄存器，源码里本来就没有名字 → 不算「起名差」，另行计入 unresolvable
+            unresolvable.append(nm_i)
+        elif re.fullmatch(r'[a-zA-Z]\d+', nm_i):
+            # v3 / i26 这类短名：解构变量或循环计数器，Lua 里很常见
+            unresolvable.append(nm_i)
         else:
-            machine.append(nm)    # 追溯不到 → 真机名
+            full.append(nm_i)
+    machine = full
+    temps = semi
     real_words = re.findall(r'\b(?:local|function|if|then|else|for|while|'
                             r'return|end|GetService|Color3|UDim2|'
                             r'ESP|Players|Camera|Key|Text|Box)\b', src)
@@ -114,6 +160,7 @@ def analyze(path):
         "syntax_ok": ok,
         "syntax_msg": msg,
         "machine_names": len(machine),
+        "unresolvable": len(unresolvable),
         "temp_vars": len(temps),
         "declared_count": len(declared),
         "semantic_names": len(semantic_set),
@@ -127,6 +174,9 @@ def analyze(path):
         "assignments": assignments,
         "control": control,
         "readable_strings": len(readable_strings),
+        "slot_reads": len(re.findall(r'\b\w+\[\d+\]\.\w+', src)),
+        "long_lines": sum(1 for l in code_lines if len(l) > 120),
+        "max_line": max((len(l) for l in code_lines), default=0),
         "functions": max(funcs, 1),
         "avg_line_len": sum(len(l) for l in lines) / n if n else 0,
     }
@@ -159,25 +209,27 @@ def score(d):
     total_names = (d["machine_names"] + d["temp_vars"] * 0.3
                    + d["semantic_names"])
     if total_names:
-        weighted = d["machine_names"] + d["temp_vars"] * 0.3
-        machine_pct = 100.0 * weighted / total_names
+        # 半语义（tbl_7 / onFrame2）按 0.35 折算，原名不可得的不计罚
+        weighted = d["machine_names"] + d["temp_vars"] * 0.35
+        denom = d["machine_names"] + d["temp_vars"] + d["semantic_names"]
+        machine_pct = 100.0 * weighted / max(denom, 1)
         pts = max(0, int(15 * (1 - min(machine_pct / 40, 1))))
     else:
         pts = 8
         machine_pct = 0
     s += pts
     detail.append(("命名质量", pts,
-                   f"真机名 {d['machine_names']} / 临时变量 {d['temp_vars']} "
-                   f"(权重占比 {machine_pct:.1f}%)"))
+                   f"机名 {d['machine_names']} / 半语义 {d['temp_vars']} / "
+                   f"原名不可得 {d['unresolvable']}"))
 
     # 4) 缩进规整 10 分
     pts = min(10, int(10 * min(d["indent_pct"] / 60, 1.0)))
     s += pts
     detail.append(("缩进规整", pts, f"{d['indent_pct']:.0f}% 行有缩进"))
 
-    # 5) 无噪音 5 分
+    # 5) 无噪音 3 分
     noise = d["warn_marks"] * 2 + d["todo"] * 2 + d["empty_blocks"]
-    pts = max(0, 5 - min(5, noise // 4))
+    pts = max(0, 3 - min(3, noise // 4))
     s += pts
     detail.append(("无噪音", pts,
                    f"⚠×{d['warn_marks']} TODO×{d['todo']} 空函数×{d['empty_blocks']}"))
@@ -195,6 +247,12 @@ def score(d):
     s += pts
     detail.append(("逻辑完整度", pts,
                    f"{omitted} 处函数体缺失 / 共 {funcs} 个函数 ({omit_pct:.0f}%)"))
+
+    # 6.5) 行长合理度 5 分（从「无噪音」里挪 3 分出来）
+    long_pct = 100.0 * d["long_lines"] / max(d["code_lines"], 1)
+    pts = max(0, 5 - int(min(5, long_pct / 4)))
+    s += pts
+    detail.append(("行长合理", pts, f"{d['long_lines']} 行 >120 字符 ({long_pct:.1f}%)"))
 
     # 7) 业务文案 5 分
     pts = min(5, int(5 * min(d["readable_strings"] / 60, 1.0)))
@@ -245,6 +303,7 @@ def main():
             ("语义名", "semantic_names"), ("调用", "calls"),
             ("赋值", "assignments"), ("控制流", "control"),
             ("函数", "functions"),
+            ("槽位访问", "slot_reads"), ("长行>120", "long_lines"),
             ("注释行", "comments"), ("可读文案", "readable_strings"),
             ("平均行长", "avg_line_len")]
     print(f"  {'指标':<12}{'旧':>12}{'新':>12}")

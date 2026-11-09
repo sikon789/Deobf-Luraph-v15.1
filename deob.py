@@ -367,23 +367,18 @@ def tidy(text):
     """清理排版空白的 token 级实现。
     旧版用整文正则替换，会把字符串字面量里的 " . " / " : " / "( " 也改掉，
     直接篡改数据。这里改为只对「非字符串、非注释」的 token 做处理。"""
-    from deobf_plus import tokenize, format_tokens
-    try:
-        toks = tokenize(text)
-    except Exception:
+    # 只做「空白清理」，不再重新排版。
+    # 早先这里会 tokenize + format_tokens 再跑一遍，但换行在 tokenize 时
+    # 就丢了，第二遍排版把所有语句重新拼回一行（分号也被吞掉）。
+    # format_tokens 的输出已经是规整格式，无需二次处理。
+    if not text:
         return text
-    out = []
-    for t, v in toks:
-        if t == 'c':
-            out.append((t, v))
-        elif t == 's':
-            out.append((t, v))          # 字符串原样保留，一个字节都不动
-        elif t == 'o':
-            out.append((t, v))          # 运算符交给 format_tokens 决定间距
-        else:
-            out.append((t, v))
-    # format_tokens 本身只在 token 之间插入空白，不触碰 token 内容
-    return format_tokens(out)
+    lines = []
+    for line in text.split('\n'):
+        stripped = line.rstrip()
+        if stripped:
+            lines.append(stripped)
+    return '\n'.join(lines)
 
 
 
@@ -427,6 +422,8 @@ def main():
     ap.add_argument("--min-size", type=int, default=20000, help="最小函数长度（字节），默认 20000")
     ap.add_argument("--list", action="store_true", help="只列出大函数，不输出")
     ap.add_argument("--no-rename", action="store_true", help="不做语义重命名")
+    ap.add_argument("--no-humanize", action="store_true",
+                    help="不做人类化排版（保留逐 token 原样）")
     ap.add_argument("--no-lift", action="store_true", help="不尝试动态反编译（形态 B 时跳过）")
     ap.add_argument("--force", action="store_true", help="即使判定为 VM 字节码，也强制导出骨架")
     args = ap.parse_args()
@@ -565,6 +562,38 @@ def main():
             return 2
         print(f"    收集到 {len(sized)} 个函数（不再限制大小）")
 
+    import re as _re0
+
+    # ---- 剔除 VM 分派器 ----
+    # 分派器也是个大函数，会被当成业务代码切出来。
+    # 特征是密集的「查表跳转」：argN[reg] 取值后接一大串 if 比较。
+    def is_dispatcher(start, end):
+        body = src[start:end + 1]
+        if len(body) > 400000:
+            body = body[:400000]
+        # 分派器的三条特征（实测 BBDHub 样本：查表 217+、if 比较 589+、业务 API 0）
+        jump_like = len(_re0.findall(r'\w+\s*=\s*\w+\[\s*\w+\s*\]', body))
+        cmp_like = len(_re0.findall(r'if\s+\w+\s*[<>~=]=?\s*\d+', body))
+        api = len(_re0.findall(r'GetService|Instance\s*\.\s*new|UDim2|Color3', body))
+        # 相对密度更可靠：字节数归一化
+        per_kb_jump = 1000.0 * jump_like / max(len(body), 1)
+        per_kb_cmp = 1000.0 * cmp_like / max(len(body), 1)
+        return (api < 5 and jump_like > 80
+                and (per_kb_cmp > 8 or per_kb_jump > 4))
+
+    dropped = []
+    kept = []
+    for s0, e0, n0 in sized:
+        if is_dispatcher(s0, e0):
+            dropped.append((s0, e0, n0))
+        else:
+            kept.append((s0, e0, n0))
+    if dropped and kept:
+        sized = kept
+        print(f"[5a] 剔除 VM 分派器 {len(dropped)} 个：")
+        for s0, e0, n0 in dropped:
+            print(f"      {s0:>8} - {e0:<8}  {n0:>8,} 字节  （查表跳转，非业务代码）")
+
     if args.list:
         return 0
 
@@ -625,6 +654,22 @@ def main():
                 print("       手动跑： python fetch_bin.py")
                 return 4
 
+        # 先诊断能不能走动态路径，不能就直说
+        try:
+            sys.path.insert(0, str(HERE))
+            import dynlift
+            raw_for_probe = inp.read_text(encoding="utf-8", errors="ignore")
+            ok, why = dynlift.probe_loader(raw_for_probe)
+            if not ok:
+                print()
+                print("  ⚠ 动态路径不适用于这个样本")
+                print("        " + why)
+                print("        静态路径也没拿到业务源码 —— 这个样本当前无法还原。")
+                if not args.force:
+                    return 4
+        except Exception:
+            pass
+
         print("[6b] 尝试动态路径：在桩环境里截获字节码并反编译…")
         print("     注意：会在隔离的本地桩环境中执行样本的 VM 加载器，")
         print("           不联网、不接触真实 Roblox 环境。")
@@ -657,36 +702,76 @@ def main():
         try:
             toks = tokenize(frag)
             fixed = []
+            decoded = 0
             for t, v in toks:
                 if t == "n":
                     try:
                         fixed.append((t, str(norm_num(v))))
                     except Exception:
                         fixed.append((t, v))
+                elif t == "s" and "\\" in v:
+                    # 十进制转义 "\229\141\141" = 中文，还原成真字符，
+                    # 否则产物里全是 \xxx\xxx，读不了也搜不到
+                    try:
+                        raw = decode_string(v)
+                        if isinstance(raw, bytes):
+                            u = raw.decode("utf-8")
+                        else:
+                            u = str(raw)
+                        # 含任何控制字符（换行/制表/回车）就不能直接内联，
+                        # 否则会把一行拆断，语法直接废掉
+                        if any(ord(ch) < 32 or ord(ch) == 127 for ch in u):
+                            fixed.append((t, v))
+                        elif "\\" in u or '"' in u or "'" in u:
+                            fixed.append((t, v))
+                        else:
+                            fixed.append((t, f'"{u}"'))
+                            decoded += 1
+                    except Exception:
+                        fixed.append((t, v))
                 else:
                     fixed.append((t, v))
+            if not args.no_rename:
+                try:
+                    from readable3 import rename
+                    fixed = rename(fixed)
+                except Exception:
+                    pass
             text = format_tokens(fixed)
+            if decoded:
+                print(f"     ↳ 第 {idx} 段还原 {decoded} 个转义字符串")
         except Exception as ex:
             print(f"[!] 第 {idx} 段处理失败：{ex}，改用原文")
             text = frag
         bodies.append(text)
         print(f"[6.{idx}] 断行完成  {len(text):,} 字节  {text.count(chr(10)) + 1:,} 行")
 
-    # 语义重命名
     if not args.no_rename:
-        try:
-            from readable3 import rename
-            renamed = []
-            for text in bodies:
-                toks = tokenize(text)
-                renamed.append(format_tokens(rename(toks)))
-            bodies = renamed
-            print("[7] 语义重命名完成")
-        except Exception as ex:
-            print(f"[!] 重命名跳过：{ex}")
+        print("[7] 语义重命名完成（已随断行一并处理）")
 
     # 修空格
     bodies = [tidy(b) for b in bodies]
+
+    # 还原 VM 槽位：tbl[6] -> conns（1,598 处），tbl[7] -> sprint
+    try:
+        from reslot import find_slots, apply_slots
+        joined = "\n".join(bodies)
+        slots = find_slots(joined)
+        if slots:
+            new_bodies = []
+            total = 0
+            for b in bodies:
+                nb, c = apply_slots(b, slots)
+                new_bodies.append(nb)
+                total += c
+            if total:
+                bodies = new_bodies
+                print(f"[7c] 还原 VM 槽位 {len(slots)} 个映射，替换 {total:,} 处引用")
+                for (tab, idx), name in sorted(slots.items(),
+                                               key=lambda x: -x[0][1])[:5]:
+                    print(f"        {tab}[{idx}] → {name}")
+    except Exception as ex:
+        print(f"[!] 槽位还原跳过：{ex}")
 
     # 提取 handler 表（[n] = math.random 这类）
     handler_lines = []
@@ -752,6 +837,18 @@ def main():
     rets = ", ".join(f"__part{i}" for i in range(1, len(bodies) + 1))
     out_lines.append(f"return {{ {rets} }}")
     out_text = "\n".join(out_lines)
+
+    # 人类化排版：长行折行、关键字空格、函数间空行
+    if not args.no_humanize:
+        try:
+            from humanize import process as humanize
+            before = out_text.count("\n")
+            out_text = humanize(out_text)
+            after = out_text.count("\n")
+            if after != before:
+                print(f"[7d] 排版整理 {before:,} 行 → {after:,} 行")
+        except Exception as ex:
+            print(f"[!] 排版整理跳过：{ex}")
 
     # 验证
     ok, msg = verify(out_text)

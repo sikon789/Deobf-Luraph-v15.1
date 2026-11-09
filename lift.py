@@ -29,7 +29,7 @@ LIFTER = TOOLS / "luau-lifter"
 GLIBC = TOOLS / "glibc"
 
 REPO = "sikon789/Deobf-Luraph-v15.1"
-TAG = "v1.3.0"
+TAG = "v1.5.0"
 MIRRORS = [
     "https://ghproxy.net/https://github.com/{repo}/releases/download/{tag}/{name}",
     "https://github.com/{repo}/releases/download/{tag}/{name}",

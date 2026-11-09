@@ -31,7 +31,7 @@ BIN = HERE / "bin"
 
 # Release 地址。换版本时改这两行即可
 REPO = "sikon789/Deobf-Luraph-v15.1"
-TAG = "v1.3.0"
+TAG = "v1.5.0"
 
 # 文件清单：仓库内名字 → (Release 附件名)
 ARTIFACTS = ["luau", "luau-ast"]

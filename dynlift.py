@@ -34,6 +34,29 @@ def find_luau():
     return shutil.which("luau")
 
 
+LOADER_SIGNS = [
+    ('_vmcore.luau_load', '标准 VM 模块'),
+    ('luau_load', 'luau_load 调用'),
+    ('luau_deserialize', 'luau_deserialize'),
+    ('vmcore', 'vmcore 表'),
+]
+
+
+def probe_loader(src):
+    """诊断这个样本能不能走动态截获。
+    返回 (ok, 说明)。ok=False 时给出具体原因，不要假装能跑。"""
+    hits = [(pat, desc) for pat, desc in LOADER_SIGNS if pat in src]
+    if not hits:
+        return False, ("样本里找不到 luau_load / vmcore / luau_deserialize。\n"
+                       "        说明它的 VM 是内联展开的，或者加载器被改名了。\n"
+                       "        当前动态路径锚定唯一写法，处理不了这种。")
+    if not any(p in src for p, _ in hits if p == '_vmcore.luau_load'):
+        return False, (f"有 VM 痕迹（{hits[0][1]}），但没有 `_vmcore.luau_load` 这类调用点。\n"
+                       "        VM 可能是内联展开的，截获点不固定。\n"
+                       "        需要针对这个变体单独定位。")
+    return True, f"检测到加载器：{hits[0][1]}"
+
+
 def find_hook_point(src):
     """找 luau_load 的调用语句起点。
     直接锚在 `local _lo,_main=_pc(_vmcore.luau_load` 上，

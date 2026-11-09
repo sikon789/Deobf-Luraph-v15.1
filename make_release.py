@@ -11,7 +11,7 @@ GitHub 的 Release 附件必须是单独文件，不能是 zip 里的成员。
 
 用法:
     python make_release.py              # 生成当前架构 + 所有已有架构
-    python make_release.py --tag v1.3.0 # 同时打印上传说明
+    python make_release.py --tag v1.5.0 # 同时打印上传说明
 """
 import sys
 import shutil
@@ -37,7 +37,7 @@ def elf_arch(path):
 
 
 def main():
-    tag = "v1.3.0"
+    tag = "v1.5.0"
     for i, a in enumerate(sys.argv):
         if a == "--tag" and i + 1 < len(sys.argv):
             tag = sys.argv[i + 1]
