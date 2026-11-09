@@ -119,25 +119,36 @@ def detect(src_text):
     # 源码里是表字段值（buffer.readu8 这种），不是调用形式，所以两种都数
     buf_hits = len(re.findall(r'buffer\s*\.\s*(?:readu8|create|fromstring|readu32|'
                              r'writeu8|writestring|readstring|len|copy|tostring)', src_text))
-    if buf_hits >= 8:
+    if buf_hits >= 5:
         info['score'] += 2
         info['reasons'].append(f'buffer 库引用 {buf_hits} 处')
 
     # 特征 4：大量统一签名的 handler（Luraph 的 handler 都是 6~13 个短参数）
-    pat = re.compile(r'(?:\[\s*\d+\s*\]|\b[a-zA-Z_]\w*)\s*=\s*function\s*\(\s*'
-                     r'\w{1,2}\s*,\s*\w{1,2}\s*,\s*\w{1,2}\s*,\s*\w{1,2}\s*,\s*\w{1,2}\s*,\s*\w{1,2}')
+    pat = re.compile(r'(?:\[\s*\d+\s*\]|\b[a-zA-Z_][\w]*)\s*=\s*function\s*\(\s*'
+                     r'\w{1,2}\s*,\s*\w{1,2}\s*,\s*\w{1,2}\s*,\s*\w{1,2}\s*,\s*\w{1,2}')
     hs = pat.findall(src_text)
-    if len(hs) >= 20:
+    if len(hs) >= 15:
         info['score'] += 3
         info['reasons'].append(f'{len(hs)} 个统一签名的 handler 函数')
 
-    # 特征 5：内嵌超长字符串（F6 类密文表）。Luau 里可能是单/双引号或长括号
+    # 特征 5：内嵌超长字符串（密文表）。三种写法都要支持：
+    #   "..."   '...'   [==[...]==]（长括号，Luraph 常用）
+    found_len = 0
     for m in re.finditer(r'=\s*(?:"([^"]{50000,})"|\'([^\']{50000,})\')', src_text):
-        s = m.group(1) or m.group(2)
-        info['bigString'] = len(s)
-        info['score'] += 2
-        info['reasons'].append(f'内嵌 {len(s):,} 字符的密文串')
+        found_len = len(m.group(1) or m.group(2))
         break
+    if not found_len:
+        for m in re.finditer(r'=\s*\[(=*)\[', src_text):
+            lvl = len(m.group(1))
+            close = ']' + '=' * lvl + ']'
+            end = src_text.find(close, m.end())
+            if end > 0 and (end - m.end()) >= 50000:
+                found_len = end - m.end()
+                break
+    if found_len:
+        info['bigString'] = found_len
+        info['score'] += 2
+        info['reasons'].append(f'内嵌 {found_len:,} 字符的密文串')
 
     return info['score'] >= 6, info
 
@@ -267,21 +278,32 @@ def dissect(sample: Path, verbose=True):
         if len(val) < 500:
             str_tables[key] = {'len': len(val), 'value': val}
             continue
-        # 切段：用 ASCII 可见区间里低频出现的标点做分隔（Luraph 常用 [ -&|-~]）
-        seps = set(' !"#$%&|}~')
+        # 切段：Luraph 的候选分隔符是 [ -&|-~] 这 10 个标点，
+        # 但**不同样本实际用作分隔符的只是其中一部分**：
+        #   · 真正当分隔符用的：全文只出现 3~4 次
+        #   · 被当数据内容用的：出现数千次
+        # 分界非常明确，按频率判断；一律当分隔符会切出上万个假段。
+        cand = ' !"#$%&|}~'
+        cnt = {ch: val.count(ch) for ch in cand}
+        threshold = max(20, len(val) // 1000)
+        seps = {ch for ch, n in cnt.items() if 0 < n <= threshold}
+        if not seps:
+            seps = set(cand)
         segs, cur = [], 0
         for i, ch in enumerate(val):
             if i >= 4 and ch in seps:
                 segs.append(i - cur)
                 cur = i + 1
         segs.append(len(val) - cur)
-        segs = [s for s in segs if s > 0]
+        segs = [x for x in segs if x > 0]
         str_tables[key] = {
             'len': len(val),
             'segments': len(segs),
             'segment_lens': segs[:40],
             'alphabet': len(set(val)),
             'head4': val[:4],
+            'seps': ''.join(sorted(seps)),
+            'sep_counts': {ch: cnt[ch] for ch in sorted(cnt)},
         }
 
     # 诱饵槽位检测：统计 handler 间互相引用的方式有三种
@@ -619,10 +641,16 @@ else
     for i, e in ipairs(CAPTURED.loads) do
         emit(string.format('### 捕获 %d：%s  %d 字节', i, e.name, #e.src))
         emit('')
-        emit('```lua')
-        emit(e.src:sub(1, 20000))
+        -- 完整输出，用 base64 分段，避免 sub() 截断
+        emit('```')
+        local enc = b64(e.src)
+        for k = 1, #enc, 700 do
+            emit(enc:sub(k, k + 699))
+        end
         emit('```')
         emit('')
+        emit(string.format('（上面是 base64，解码后 %d 字节。\n'
+            .. '  快速预览：\n```lua\n%s\n```）', #e.src, e.src:sub(1, 3000)))
     end
 end
 
@@ -828,9 +856,16 @@ def run_harness(harness: Path, timeout=180):
                                  'bytes': int(m.group(3).replace(',', ''))}
     # 把捕获到的源码抽出来，方便调用方落盘
     if m:
-        blk = re.search(r'### 捕获 \d+：\w+\s+[\d,]+ 字节\n\n```lua\n(.*?)\n```',
+        # 报告里明文是 base64 分段的（完整），下面还有一段 lua 预览，只取 base64
+        blk = re.search(r'### 捕获 \d+：\w+\s+[\d,]+ 字节\n\n```\n(.*?)\n```',
                         text, re.S)
         if blk:
-            res['captured_src'] = blk.group(1)
+            import base64
+            try:
+                raw = base64.b64decode(''.join(blk.group(1).split()))
+                res['captured_src'] = raw.decode('utf-8', errors='ignore')
+                res['captured_bytes'] = len(raw)
+            except Exception as e:
+                res['captured_decode_error'] = str(e)
 
     return res

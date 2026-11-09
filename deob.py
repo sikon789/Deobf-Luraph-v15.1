@@ -713,6 +713,32 @@ def main():
                             print("[6e] 在本地运行自跑脚本，采集实测数据…")
                             run = inlinevm.run_harness(p)
 
+                            # ── 拦到明文 = 直接交付源码，不再走自跑脚本那条路 ──
+                            if run.get('captured_plain') and run.get('captured_src'):
+                                cp = run['captured_plain']
+                                out_src = inp.with_name(inp.stem + '.unpacked.lua')
+                                out_src.write_text(run['captured_src'], encoding='utf-8')
+                                print()
+                                print("═" * 64)
+                                print("  ✓ 已解出源码")
+                                print("═" * 64)
+                                print(f"  通过 {cp['via']} 截获 {cp['bytes']:,} 字节明文")
+                                print(f"  （buffer.readu8 调用 {run.get('reads', 0):,} 次，"
+                                      f"分配 {run.get('buffers', 0)} 个 buffer）")
+                                print(f"  → {out_src}")
+                                # 判断解出来的东西还能不能再剥一层
+                                try:
+                                    inner = out_src.read_text(encoding='utf-8', errors='ignore')
+                                    is_inl, _ = inlinevm.detect(inner)
+                                    if is_inl:
+                                        print()
+                                        print("  注意：解出来的还是 Luraph 混淆（双层样本）。")
+                                        print(f"        再跑一次即可下一层：python deob.py {out_src.name}")
+                                except Exception:
+                                    pass
+                                print("═" * 64)
+                                return 0
+
                             print()
                             print("═" * 64)
                             print("  为什么交付的是自跑脚本，而不是源码")
@@ -747,10 +773,24 @@ def main():
                                 if run.get('exec_ok'):
                                     print("  VM 完整跑完了。")
                                 else:
-                                    err = (run.get('exec_err') or '')[:110]
-                                    print(f"  最后一跳失败：{err}")
-                                    print("  这里的错误词在整份源码里搜不到 —— 它只可能来自")
-                                    print("  解密后的字节码，也就是说解密本身是成功的。")
+                                    err = (run.get('exec_err') or '')
+                                    print(f"  执行未跑完：{err[:110]}")
+                                    # 分情况说明，不要一律套「解密成功但缺 Roblox」的模板
+                                    low = err.lower()
+                                    if 'buffer expected' in low or 'got nil' in low:
+                                        print()
+                                        print("  这是「缺少输入」而不是「缺 Roblox 运行时」：")
+                                        print("  VM 的入口要一段字节码 buffer，而这个样本的字节码")
+                                        print("  由外层供给（双层混淆）。单独跑内层必然拿到 nil。")
+                                        print("  正确做法是连外层一起跑。")
+                                    elif 'cancel' in low or "with 'new'" in low or 'index nil' in low:
+                                        print()
+                                        print("  这是「缺 Roblox 运行时」：解密后的业务代码要调 tween /")
+                                        print("  instance 这类真实对象。这个错误词在整份源码里搜不到，")
+                                        print("  只可能来自解密后的字节码 —— 说明解密本身是成功的。")
+                                    else:
+                                        print()
+                                        print("  错误原因见上。")
                             print()
                             print("  → 把自跑脚本放到有 Roblox 的机器上运行，它会自己：")
                             print("      1. dump VM 分配的每一个 buffer")
