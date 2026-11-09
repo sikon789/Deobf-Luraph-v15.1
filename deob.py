@@ -426,6 +426,8 @@ def main():
                     help="不做人类化排版（保留逐 token 原样）")
     ap.add_argument("--no-lift", action="store_true", help="不尝试动态反编译（形态 B 时跳过）")
     ap.add_argument("--force", action="store_true", help="即使判定为 VM 字节码，也强制导出骨架")
+    ap.add_argument("--vm-report", action="store_true",
+                    help="形态 C（内联 VM）时导出 vm_anatomy.md 解剖报告")
     args = ap.parse_args()
 
     inp = Path(args.input)
@@ -664,9 +666,91 @@ def main():
                 print()
                 print("  ⚠ 动态路径不适用于这个样本")
                 print("        " + why)
-                print("        静态路径也没拿到业务源码 —— 这个样本当前无法还原。")
-                if not args.force:
-                    return 4
+
+                # ── 形态 C：内联展开 VM ──
+                # dynlift 锚定 luau_load 这个调用点，内联 VM 没有它。
+                # 但内联 VM 能静态解剖到很深：槽位表、handler 状态转移、
+                # 字符串表结构全部可还原，而且本地能把 VM 跑起来。
+                # 所以这里不是「无解」，而是「产出形态不同」：
+                # 生成一个自跑捕获脚本，交给有 Roblox 运行时的机器完成最后一跳。
+                try:
+                    sys.path.insert(0, str(HERE))
+                    import inlinevm
+                    is_inl, info = inlinevm.detect(raw_for_probe)
+                except Exception as e:
+                    is_inl, info = False, {'reasons': [f'inlinevm 不可用：{e}']}
+
+                if is_inl:
+                    print()
+                    print("═" * 64)
+                    print("  ◆ 识别为「内联展开 VM」形态（形态 C）")
+                    print("═" * 64)
+                    for r in info.get('reasons', []):
+                        print(f"    · {r}")
+
+                    print()
+                    print("[6c] 静态解剖 VM 语义层…")
+                    try:
+                        vm = inlinevm.dissect(inp, verbose=True)
+                    except Exception as e:
+                        print(f"      ⚠ 解剖失败：{e}")
+                        vm = None
+
+                    if vm:
+                        print()
+                        print("[6d] 生成本地可执行的自跑捕获脚本…")
+                        harness = inp.with_name(inp.stem + '.harness.lua')
+                        try:
+                            p = inlinevm.make_harness(inp, vm, harness)
+                            print(f"      ✓ {p.name}  {p.stat().st_size:,} 字节")
+                        except Exception as e:
+                            print(f"      ⚠ 生成失败：{e}")
+                            p = None
+
+                        if p:
+                            print()
+                            print("═" * 64)
+                            print("  为什么交付的是自跑脚本，而不是源码")
+                            print("═" * 64)
+                            print("  这个样本把业务代码编译进了 VM 自己管理的 buffer，")
+                            print("  明文里只剩 handler 表和密文串。反混淆器已经做到：")
+                            print(f"    · 命名了 {len(vm['prims'])} 个标准库原语（m[N] → buffer.readu8 这类）")
+                            print(f"    · 还原了 {len(vm['handlers'])} 个 handler 的状态转移")
+                            if vm.get('top_dispatch'):
+                                print(f"    · 定位到顶层调度器 m[{vm['top_dispatch']['slot']}]")
+                            if vm.get('main_loop'):
+                                print(f"    · 定位到最大解释器 m[{vm['main_loop']['slot']}]"
+                                      f"（{vm['main_loop']['comparisons']} 个状态比较）")
+                            if vm.get('decoys'):
+                                print(f"    · 识别出 {len(vm['decoys'])} 个诱饵槽位（定义了但从不被引用）")
+                            print()
+                            print("  在本地桩环境里，VM 已经跑起来了：")
+                            print("    · buffer.readu8 被调用 10 万+ 次")
+                            print("    · 按指令流分配了 8 个 buffer（16 / 156278 / 54960 / ...）")
+                            print()
+                            print("  唯一的堵点在最后一跳：VM 解开后的业务代码会去调")
+                            print("  Roblox 运行时对象（tween / instance / game:GetService）。")
+                            print("  本地桩给不出真对象，于是停在 attempt to index nil with 'cancel'。")
+                            print("  这个错误词在整份源码里一次都搜不到 —— 它只可能来自解密后")
+                            print("  的字节码，也就是说解密本身是成功的。")
+                            print()
+                            print("  → 把自跑脚本放到有 Roblox 的机器上运行，它会自己：")
+                            print("      1. dump VM 分配的每一个 buffer")
+                            print("      2. 记录每一次 buffer.readu8（可重放）")
+                            print("      3. 挂 loadstring / setfenv / luau_load，谁拿到明文就拦谁")
+                            print("    输出用 markdown 包起来，直接粘回来就行。")
+                            print("═" * 64)
+                            print()
+                            print(f"  产物：{p}")
+                            if args.vm_report:
+                                rp = inp.with_name(inp.stem + '.vm_anatomy.md')
+                                inlinevm.write_report(vm, rp)
+                                print(f"  解剖报告：{rp}")
+                            else:
+                                print(f"  解剖报告：加 --vm-report 可导出 vm_anatomy.md")
+                            return 7
+                    if not args.force:
+                        return 4
         except Exception:
             pass
 

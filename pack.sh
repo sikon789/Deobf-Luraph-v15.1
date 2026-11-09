@@ -26,7 +26,7 @@ echo "[pack] 检查必带文件："
 for f in deob.py dynlift.py lift.py fetch_bin.py build_x86.py \
          make_release.py fastsolve.py mkfast.py bufemu.lua robstub.lua \
          readability.py report.py pretty.py pack.sh \
-         humanize.py reslot.py \
+         humanize.py reslot.py inlinevm.py \
          libs/deobf_plus.py libs/beautify2.py libs/readable3.py; do
     if [ -f "$TMP/$f" ]; then
         printf '  ✓ %-24s %8s 字节\n' "$f" "$(stat -c%s "$TMP/$f")"
