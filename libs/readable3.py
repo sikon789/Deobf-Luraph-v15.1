@@ -79,6 +79,13 @@ def expr_end(toks, k, n):
     return k
 
 
+_KEYWORDS = {
+    'and', 'break', 'continue', 'do', 'else', 'elseif', 'end', 'false',
+    'for', 'function', 'if', 'in', 'local', 'nil', 'not', 'or', 'repeat',
+    'return', 'then', 'true', 'until', 'while', 'type', 'export',
+}
+
+
 def derive(seg, resolve):
     if not seg:
         return None
@@ -86,6 +93,15 @@ def derive(seg, resolve):
     if len(seg) == 1 and t0[0] == 'w':
         return resolve(t0[1])          # 纯标识符：沿用被赋值的名字
     if t0 == ('o', '{'):
+        # 表字面量：用第一个非空字段名当线索
+        # {conns = {}, drawings = {}, ...}   -> conns
+        # {on = false, slot = 2, ...}        -> on
+        # {sprint = {...}, speed = {...}}     -> 用外层字段名
+        for k in range(1, min(len(seg) - 1, 24)):
+            if seg[k][0] == 'w' and k + 1 < len(seg) and seg[k + 1] == ('o', '='):
+                cand = seg[k][1]
+                if cand.isidentifier() and cand not in _KEYWORDS:
+                    return cand
         return 'tbl'
     if t0[0] == 'n':
         return 'num'
@@ -94,11 +110,39 @@ def derive(seg, resolve):
     if t0[0] == 'w':
         w = t0[1]
         if w == 'function':
+            # 匿名函数：从函数体里第一条有意义的 API 调用猜用途
+            # 注意 seg 是 token 列表，不是字符串
+            body = ' '.join(t[1] for t in seg[:400])
+            for kw, nm in (
+                ('RenderStepped', 'onFrame'),
+                ('Heartbeat', 'onTick'),
+                ('Stepped', 'onStep'),
+                ('InputBegan', 'onInput'),
+                ('InputChanged', 'onInputChanged'),
+                ('InputEnded', 'onInputEnded'),
+                ('MouseButton1Click', 'onClick'),
+                ('GetService', 'initServices'),
+                ('pcall', 'safeCall'),
+                ('tween', 'tween'),
+                ('Create', 'create'),
+                ('Destroy', 'destroy'),
+                ('Disconnect', 'disconnect'),
+                ('getgenv', 'setupEnv'),
+                ('writefile', 'saveFile'),
+                ('readfile', 'loadFile'),
+                ('Drawing', 'draw'),
+                ('Raycast', 'raycast'),
+            ):
+                if kw in body:
+                    return nm
             return 'fn'
         if w in ('true', 'false'):
             return 'flag'
         if w == 'not':
             return 'cond'
+        # 下标取值 tbl[7] / arg[96]：直接用「容器名+下标」
+        if len(seg) >= 3 and seg[1] == ('o', '[') and seg[2][0] == 'n':
+            return f"{w}_{seg[2][1]}"
         parts = [w]
         k = 1
         while k + 1 < len(seg) and seg[k][0] == 'o' and seg[k][1] in ('.', ':'):
@@ -108,22 +152,71 @@ def derive(seg, resolve):
             k += 2
         if len(parts) > 1:
             meth = parts[-1]
+            obj = parts[0]
+            # 类型构造：Color3.fromRGB -> color, UDim2.new -> dim
+            type_map = {
+                'Color3': 'color', 'CFrame': 'cf', 'Vector2': 'vec2',
+                'Vector3': 'vec3', 'UDim2': 'dim', 'UDim': 'dim',
+                'Rect': 'rect', 'NumberSequence': 'seq', 'ColorSequence': 'colorSeq',
+                'Content': 'content', 'Font': 'font', 'BrickColor': 'brickColor',
+            }
+            if obj in type_map:
+                if meth in ('fromRGB', 'fromHex', 'new'):
+                    return type_map[obj]
             if meth == 'new':
-                return parts[0] + '_new'
-            if meth in ('fromRGB', 'fromHex'):
-                return 'rgb'
-            if meth == 'fromScale':
+                # Drawing.new -> drawing；Instance.new -> inst
+                return {'Drawing': 'drawing'}.get(obj, obj + '_new')
+            if meth.startswith('Get') and meth.endswith('FromCharacter'):
+                return 'player'
+            if meth in ('fromScale',):
                 return 'scale'
-            if meth == 'fromOffset':
+            if meth in ('fromOffset',):
                 return 'offset'
-            if meth == 'fromEnum':
+            if meth in ('fromEnum',):
                 return 'enum'
+            # 查询类：FindFirstChild -> child
+            q = {
+                'FindFirstChild': 'child', 'FindFirstChildOfClass': 'child',
+                'WaitForChild': 'child', 'GetChildren': 'children',
+                'GetDescendants': 'descendants', 'GetPlayers': 'players',
+                'GetMouseLocation': 'mousePos',
+                'WorldToViewportPoint': 'screenPos', 'Raycast': 'hit',
+            }
+            if meth in q:
+                return q[meth]
             return meth
         if len(seg) >= 4 and seg[1] == ('o', '(') and seg[2][0] == 's':
             s = seg[2][1].strip('"\'')
             if s and s.isidentifier():
                 return s
-        return resolve(w) + 'Res'
+        # 调用结果：用被调函数名 + 语义后缀，而不是一律 +Res
+        #   Drawing.new(...)      -> newDrawing
+        #   workspace:FindFirstChild("x") -> x 或 foundChild
+        #   player:GetPlayerFromCharacter() -> foundPlayer
+        callee = resolve(w)
+        suffix_map = {
+            'new': 'obj', 'Create': 'obj', 'newInstance': 'obj',
+            'FindFirstChild': 'child', 'FindFirstChildOfClass': 'child',
+            'WaitForChild': 'child', 'GetChildren': 'children',
+            'GetDescendants': 'descendants',
+            'GetPlayerFromCharacter': 'player', 'GetPlayers': 'players',
+            'GetMouseLocation': 'mousePos', 'WorldToViewportPoint': 'screenPos',
+            'Raycast': 'hit', 'GetPartsInPart': 'parts',
+            'PCall': 'res', 'pcall': 'res',
+        }
+        tail = parts[-1] if len(parts) > 1 else ''
+        if tail in suffix_map:
+            return suffix_map[tail] + (callee if callee not in ('fn', 'tbl') else '')
+        if callee and callee not in ('fn', 'tbl', 'v'):
+            return callee + 'Res'
+        return 'Res'
+    if t0[0] == 'w':
+        # tbl[7] / arg[96] 这种下标取值：用「容器名 + 下标」更具体
+        k = 1
+        while k + 1 < len(seg) and seg[k] == ('o', '['):
+            if seg[k + 1][0] == 'n':
+                return f"{t0[1]}{seg[k + 1][1]}"
+            break
     return None
 
 
@@ -152,11 +245,30 @@ def rename(toks):
             cur.names[name] = lst
         lst.append((idx, base))
 
+    def in_scope_listed(nm):
+        """只在当前作用域链上查重名。
+        早先用全文件集合 used，导致每个局部变量 C 都撞名变成 C2/C3/...
+        最后满屏 v1234。真正需要的是「同一作用域内不重名」。"""
+        sc = cur
+        while sc is not None:
+            for lst in sc.names.values():
+                for _, b in lst:
+                    if b == nm:
+                        return True
+            sc = sc.parent
+        return nm in BAD_BASE
+
     def bind(name, idx, base):
         base = sanitize(base) or 'val'
-        if base in used:
+        # 单字母原名：只有「没推出更好的名字」时才保留
+        if (len(name) <= 2 and name.isalpha() and name.isidentifier()
+                and base in ('v', 'val', 'Res', 'num', 'str', 'cond', 'flag')):
+            if not in_scope_listed(name):
+                newnames[idx] = name
+                return name
+        if in_scope_listed(base):
             m = 2
-            while (base + str(m)) in used:
+            while in_scope_listed(base + str(m)):
                 m += 1
             base = base + str(m)
         used.add(base)
@@ -184,7 +296,41 @@ def rename(toks):
             if j < n and toks[j] == ('w', 'function'):
                 nm_idx = j + 1 if (j + 1 < n and toks[j + 1][0] == 'w') else None
                 if nm_idx is not None:
-                    bind(toks[nm_idx][1], nm_idx, 'fn')
+                    # 从函数体推断用途，而不是一律叫 fn
+                    # 取函数体前 400 个 token 做关键词匹配
+                    body = ' '.join(t[1] for t in toks[j:min(n, j + 400)])
+                    base = 'fn'
+                    for kw, nm in (
+                        ('RenderStepped', 'onFrame'),
+                        ('Heartbeat', 'onTick'),
+                        ('Stepped', 'onStep'),
+                        ('InputBegan', 'onInput'),
+                        ('InputChanged', 'onInputChanged'),
+                        ('InputEnded', 'onInputEnded'),
+                        ('MouseButton1Click', 'onClick'),
+                        ('pcall', 'safeCall'),
+                        ('Drawing', 'draw'),
+                        ('Raycast', 'raycast'),
+                        ('getgenv', 'setupEnv'),
+                        ('writefile', 'saveFile'),
+                        ('readfile', 'loadFile'),
+                        ('Tween', 'tween'),
+                        ('Create', 'create'),
+                        ('Destroy', 'destroy'),
+                        ('Disconnect', 'disconnect'),
+                        ('Humanoid', 'onHumanoid'),
+                        ('Character', 'onCharacter'),
+                        ('Camera', 'onCamera'),
+                        ('Health', 'onHealth'),
+                        ('Update', 'update'),
+                        ('Render', 'render'),
+                        ('Refresh', 'refresh'),
+                        ('Draw', 'draw'),
+                    ):
+                        if kw in body:
+                            base = nm
+                            break
+                    bind(toks[nm_idx][1], nm_idx, base)
                     declare(toks[nm_idx][1], nm_idx)
                     out[nm_idx] = ('w', newnames[nm_idx])
                 i = j
@@ -328,7 +474,10 @@ def rename(toks):
 
 
 def v_name(toks, idx):
-    return 'v'
+    nm = toks[idx][1] if 0 <= idx < len(toks) else 'v'
+    if len(nm) <= 2 and nm.isalpha():
+        return nm      # 单字母原名保留，比 v123 好读
+    return nm if nm.isidentifier() else 'v'
 
 
 if __name__ == '__main__':

@@ -399,7 +399,7 @@ def describe_value(vt):
 BLOCK_OPEN = {'function', 'then', 'do', 'repeat'}
 BLOCK_CLOSE = {'end', 'until'}
 STMT_START = {'local', 'return', 'if', 'for', 'while', 'break', 'continue'}
-TIGHT = {'(', ')', '[', ']', '{', '}', '.', ':', '::', ',', ';'}
+TIGHT = {'(', ')', '[', ']', '{', '}', '.', ':', '::', ','}
 
 
 def format_tokens(toks):
@@ -409,16 +409,30 @@ def format_tokens(toks):
     depth = 0            # 括号深度
     pending_fn = False   # function 参数列表尚未闭合
     fn_paren = 0
+    force_break = [False]   # 上一个 token 是分号 → 下一个 token 必须新起一行
+    brace = 0               # 花括号深度（只算 {}，不算 ()/[]）
+    cur_indent = [0]        # 当前行的缩进级别（行首锁定）
 
     def flush(ind=None):
         nonlocal cur
         t = ''.join(cur).strip()
         if t:
-            lines.append('    ' * min(max(indent if ind is None else ind, 0), 16) + t)
+            use = cur_indent[0] if ind is None else ind
+            lines.append('    ' * min(max(use, 0), 16) + t)
         cur = []
 
     prev = None
+    cur_indent[0] = 0
+
     for typ, v in toks:
+        # 行首锁定缩进：cur 为空 = 即将开始新行
+        if not cur and typ != 'c':
+            # 块结束关键字（end/until）要先减一级
+            lv = indent - 1 if (typ == 'w' and v in BLOCK_CLOSE) else indent
+            cur_indent[0] = max(0, lv + max(0, brace))
+        if force_break[0] and typ != 'c':
+            flush()
+            force_break[0] = False
         if typ == 'c':
             flush()
             lines.append('    ' * min(max(indent, 0), 16) + v)
@@ -428,10 +442,14 @@ def format_tokens(toks):
         if typ == 'o':
             if v in ('(', '[', '{'):
                 depth += 1
+                if v == '{':
+                    brace += 1
                 if pending_fn and v == '(':
                     fn_paren += 1
             elif v in (')', ']', '}'):
                 depth -= 1
+                if v == '}':
+                    brace = max(0, brace - 1)
             if v in TIGHT and v != ',':
                 cur.append(v)
                 prev = 'tight'
@@ -445,14 +463,25 @@ def format_tokens(toks):
                 continue
             if v == ',':
                 cur.append(',')
-                if depth == 1:      # 顶层 handler 表元素分隔
+                # 表/参数列表里每个元素一行。depth 跟踪的是所有括号，
+                # 这里只在「当前行已经有内容」时断行，避免空行。
+                if brace >= 1 and cur:
                     flush()
                 prev = 'tight'
                 continue
             if v == ';':
-                cur.append(';')
+                # 分号在 Lua 里只是可选语句分隔符。改成断行（语义等价）。
+                # 注意 flush() 只把累积内容推成一行，若此时 cur 为空
+                # （例如前一个 token 刚闭合大括号），就必须补一个空标记，
+                # 否则下一个 token 会接着上一次的 flush 结果拼在同一行。
                 flush()
+                force_break[0] = True
                 prev = None
+                continue
+            # 单目运算符：不加右侧空格
+            if v in ('#', '-', '~') and prev in (None, 'op', 'tight', 'stmt', '('):
+                cur.append(v)
+                prev = 'op'
                 continue
             cur.append(' ' + v + ' ')
             prev = 'op'
@@ -462,6 +491,7 @@ def format_tokens(toks):
         if typ == 'w' and v in BLOCK_CLOSE:
             flush()
             indent -= 1
+            cur_indent[0] = max(0, indent + max(0, brace))
             cur.append(v)
             flush()
             prev = 'w'
@@ -469,6 +499,7 @@ def format_tokens(toks):
         if typ == 'w' and v in ('else', 'elseif'):
             flush()
             indent -= 1
+            cur_indent[0] = max(0, indent + max(0, brace))
             cur.append(v + ' ')
             if v == 'else':
                 flush()
