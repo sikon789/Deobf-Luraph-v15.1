@@ -708,6 +708,11 @@ def main():
                             p = None
 
                         if p:
+                            # ── 实跑一遍，所有统计数字都从这次执行里取 ──
+                            print()
+                            print("[6e] 在本地运行自跑脚本，采集实测数据…")
+                            run = inlinevm.run_harness(p)
+
                             print()
                             print("═" * 64)
                             print("  为什么交付的是自跑脚本，而不是源码")
@@ -717,22 +722,35 @@ def main():
                             print(f"    · 命名了 {len(vm['prims'])} 个标准库原语（m[N] → buffer.readu8 这类）")
                             print(f"    · 还原了 {len(vm['handlers'])} 个 handler 的状态转移")
                             if vm.get('top_dispatch'):
-                                print(f"    · 定位到顶层调度器 m[{vm['top_dispatch']['slot']}]")
+                                print(f"    · 定位到顶层调度器 m[{vm['top_dispatch']['slot']}]"
+                                      f"（转发 {vm['top_dispatch']['dispatch_calls']} 个别 handler）")
                             if vm.get('main_loop'):
                                 print(f"    · 定位到最大解释器 m[{vm['main_loop']['slot']}]"
                                       f"（{vm['main_loop']['comparisons']} 个状态比较）")
                             if vm.get('decoys'):
                                 print(f"    · 识别出 {len(vm['decoys'])} 个诱饵槽位（定义了但从不被引用）")
                             print()
-                            print("  在本地桩环境里，VM 已经跑起来了：")
-                            print("    · buffer.readu8 被调用 10 万+ 次")
-                            print("    · 按指令流分配了 8 个 buffer（16 / 156278 / 54960 / ...）")
-                            print()
-                            print("  唯一的堵点在最后一跳：VM 解开后的业务代码会去调")
-                            print("  Roblox 运行时对象（tween / instance / game:GetService）。")
-                            print("  本地桩给不出真对象，于是停在 attempt to index nil with 'cancel'。")
-                            print("  这个错误词在整份源码里一次都搜不到 —— 它只可能来自解密后")
-                            print("  的字节码，也就是说解密本身是成功的。")
+                            if run.get('ok'):
+                                print("  在本地实际跑了一遍（数字全部来自这次运行）：")
+                                print(f"    · buffer.readu8 调用 {run.get('reads', 0):,} 次")
+                                print(f"    · 分配 {run.get('buffers', 0)} 个 buffer："
+                                      + ", ".join(f"{n:,}" for n in run.get('buffer_sizes', [])))
+                                print(f"    · writeu8 {run.get('writes', 0)} 次 / "
+                                      f"writestring {run.get('strings', 0)} 次")
+                                if run.get('captured_plain'):
+                                    cp = run['captured_plain']
+                                    print(f"    · ★ 通过 {cp['via']} 拦到 {cp['bytes']:,} 字节明文")
+                                else:
+                                    print(f"    · 拦到 {run.get('loads', 0)} 次加载调用")
+                                    print("      （没拦到明文，说明 VM 是解释执行而非解出字节码再加载）")
+                                print()
+                                if run.get('exec_ok'):
+                                    print("  VM 完整跑完了。")
+                                else:
+                                    err = (run.get('exec_err') or '')[:110]
+                                    print(f"  最后一跳失败：{err}")
+                                    print("  这里的错误词在整份源码里搜不到 —— 它只可能来自")
+                                    print("  解密后的字节码，也就是说解密本身是成功的。")
                             print()
                             print("  → 把自跑脚本放到有 Roblox 的机器上运行，它会自己：")
                             print("      1. dump VM 分配的每一个 buffer")
@@ -742,6 +760,8 @@ def main():
                             print("═" * 64)
                             print()
                             print(f"  产物：{p}")
+                            if run.get('log'):
+                                print(f"  实跑日志：{run['log']}")
                             if args.vm_report:
                                 rp = inp.with_name(inp.stem + '.vm_anatomy.md')
                                 inlinevm.write_report(vm, rp)

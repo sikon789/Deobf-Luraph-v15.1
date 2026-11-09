@@ -237,7 +237,7 @@ def dissect(sample: Path, verbose=True):
         if 'while' not in body:
             continue
         cmps = len(re.findall(r'if\s+\w+\s*<=\s*\d+', body))
-        dispatch = len(re.findall(r'\bm\s*:\s*[A-Za-z_]\w*\s*\(', body))
+        dispatch = len(re.findall(r'\b[A-Za-z_]\w*\s*:\s*[A-Za-z_]\w*\s*\(', body))
         if dispatch == 0:
             continue
         score = cmps + dispatch * 2
@@ -256,7 +256,7 @@ def dissect(sample: Path, verbose=True):
         if not node:
             continue
         body = _slice(src, node) or ''
-        disp = len(re.findall(r'\bm\s*:\s*[A-Za-z_]\w*\s*\(', body))
+        disp = len(re.findall(r'\b[A-Za-z_]\w*\s*:\s*[A-Za-z_]\w*\s*\(', body))
         if disp >= 3:
             top_dispatch = {'slot': key, 'dispatch_calls': disp, 'code': body}
             break
@@ -296,10 +296,10 @@ def dissect(sample: Path, verbose=True):
     for key in slots:
         k = re.escape(key)
         if key.isdigit():
-            pat = re.compile(r'\bm\s*\[\s*' + k + r'\s*\]')
+            pat = re.compile(r'\b[A-Za-z_]\w*\s*\[\s*' + k + r'\s*\]')
         else:
             # 冒号/点调用（m:X 或 m.X），以及表外的任意 :X( 形式
-            pat = re.compile(r'(?:\bm\s*[.:]\s*' + k + r'\b(?!\w))|'
+            pat = re.compile(r'(?:\b[A-Za-z_]\w*\s*[.:]\s*' + k + r'\b(?!\w))|'
                              r'(?::\s*' + k + r'\s*\()|'
                              r'(?:\.\s*' + k + r'\s*\()')
         if not pat.search(scan_space):
@@ -343,11 +343,12 @@ HARNESS_HEAD = r"""--[[
    为什么交付的是这个而不是源码
    ----------------------------
    这个样本把业务代码编译进了 VM 自己管理的 buffer 里，明文里只剩
-   180 个槽位的 handler 表和一个 __STRING_TABLE__ 字符的密文串。
+   __SLOT_COUNT__ 个槽位的 handler 表和一个 __STRING_TABLE__ 字符的密文串。
    反混淆器已经做到：
      · 命名了 __PRIM_COUNT__ 个标准库原语（m[N] → buffer.readu8 这类）
      · 还原了 __HANDLER_COUNT__ 个 handler 的状态转移
-     · 在本地跑通了 VM：buffer.readu8 被调用 10 万+ 次，按指令分配了 buffer
+     · 跑通了 VM：buffer.readu8 被调用十万次量级，按指令分配了 buffer
+     （具体数字见本次运行的 [harness] 行，不同样本差别很大）
 
    唯一过不去的是最后一跳：VM 解开之后真正执行的业务代码会去调 Roblox
    运行时对象（tween、instance、game:GetService 之类）。本地桩环境给不出
@@ -437,10 +438,19 @@ end
 buffer = setmetatable({}, { __index = __buf })
 
 -- ── 挂加载器钩子 ──
+-- 记录自身加载的源码 lua 字符串，钩子要排除它，
+-- 否则会把自己的样本当成"捕获到的明文"，这是假阳性。
+local __SELF_SRC = nil
+
 local function wrap_loader(name, fn)
     if type(fn) ~= 'function' then return fn end
     return function(src, ...)
-        if type(src) == 'string' and #src > 32 then
+        -- 排除自身：我们的 SAMPLE_SRC 一定以 "local __FB" 开头且体积极大。
+        -- 用内容特征判断，不依赖 upvalue（跨 loadstring 不共享）。
+        local isSelf = (type(src) == 'string'
+            and src:sub(1, 18) == 'local function __F'
+            and #src > 100000)
+        if type(src) == 'string' and #src > 32 and not isSelf then
             CAPTURED.loads[#CAPTURED.loads + 1] = { name = name, src = src }
         end
         return fn(src, ...)
@@ -631,9 +641,12 @@ def make_harness(sample: Path, info: dict, out: Path = None):
     strings = info.get('strings', {})
     str_total = sum(v.get('len', 0) for v in strings.values())
 
+    # 这些数字全部从解剖结果真实取值，不写死
+    n_slots = info.get('slots', len(prims) + len(handlers))
     head = (HARNESS_HEAD
             .replace('__PRIM_COUNT__', str(len(prims)))
             .replace('__HANDLER_COUNT__', str(len(handlers)))
+            .replace('__SLOT_COUNT__', str(n_slots))
             .replace('__STRING_TABLE__', f'{str_total:,}'))
 
     # 用长括号把样本包起来，避免任何转义问题
@@ -752,3 +765,72 @@ def write_report(vm: dict, out: Path):
 
     out.write_text('\n'.join(L), encoding='utf-8')
     return out
+
+
+def run_harness(harness: Path, timeout=180):
+    """在本地 Luau 上跑一遍自跑脚本，抓回实测数据。
+
+    这是「数值不写死」的关键：所有统计数字都来自这次真实执行，
+    解析 harness 自己打印的 [harness] 行和报告头。
+    返回 dict，跑不起来时返回 {'ok': False, 'error': ...}。
+    """
+    exe = None
+    for cand in (HERE / 'bin' / 'luau.aarch64', HERE / 'bin' / 'luau.x86_64',
+                 HERE / 'bin' / 'luau'):
+        if cand.is_file():
+            exe = cand
+            break
+    if exe is None:
+        import shutil
+        p = shutil.which('luau')
+        exe = Path(p) if p else None
+    if exe is None:
+        return {'ok': False, 'error': '找不到 luau 运行时'}
+
+    out_file = harness.with_suffix('.harness.log')
+    try:
+        with open(out_file, 'wb') as fh:
+            subprocess.run([str(exe), str(harness)], stdout=fh,
+                           stderr=subprocess.STDOUT, timeout=timeout)
+        text = out_file.read_text(encoding='utf-8', errors='ignore')
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'error': f'执行超时（{timeout}s）'}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+    res = {'ok': True, 'log': str(out_file), 'raw': text}
+
+    # 解析形如：[harness] buffers=N reads=N writes=N strings=N loads=N
+    m = re.search(r'\[harness\] buffers=(\d+) reads=(\d+) writes=(\d+) '
+                  r'strings=(\d+) loads=(\d+)', text)
+    if m:
+        res['buffers'] = int(m.group(1))
+        res['reads'] = int(m.group(2))
+        res['writes'] = int(m.group(3))
+        res['strings'] = int(m.group(4))
+        res['loads'] = int(m.group(5))
+
+    # 执行结果
+    m = re.search(r'\[harness\] sample pcall ok=(\w+) err=(.*)', text)
+    if m:
+        res['exec_ok'] = (m.group(1) == 'true')
+        res['exec_err'] = m.group(2).strip()
+
+    # buffer 尺寸列表
+    sizes = re.findall(r'### buf\d+\s+分配 (\d+) 字节 / 实际 (\d+) 字节', text)
+    res['buffer_sizes'] = [int(a) for a, _ in sizes]
+
+    # 是否捕获到明文（只能是 loadstring 拦到的真源码，不含自身）
+    m = re.search(r'### 捕获 (\d+)：(\w+)\s+([\d,]+) 字节', text)
+    if m:
+        res['captured_plain'] = {'index': int(m.group(1)),
+                                 'via': m.group(2),
+                                 'bytes': int(m.group(3).replace(',', ''))}
+    # 把捕获到的源码抽出来，方便调用方落盘
+    if m:
+        blk = re.search(r'### 捕获 \d+：\w+\s+[\d,]+ 字节\n\n```lua\n(.*?)\n```',
+                        text, re.S)
+        if blk:
+            res['captured_src'] = blk.group(1)
+
+    return res
