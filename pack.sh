@@ -27,7 +27,10 @@ for f in deob.py dynlift.py lift.py fetch_bin.py build_x86.py \
          make_release.py fastsolve.py mkfast.py bufemu.lua robstub.lua \
          readability.py report.py pretty.py pack.sh \
          humanize.py reslot.py inlinevm.py \
-         libs/deobf_plus.py libs/beautify2.py libs/readable3.py; do
+         libs/deobf_plus.py libs/beautify2.py libs/readable3.py \
+         vmsem.py vmreplay.py vmverify.py vmtable.py vmdis.py vmdecomp.py \
+         vtrace.py vtrace_slot.py vtrace_seg.py vtrace_chk.py \
+         hostenv.py hostvector.py hostunicode.py path2d.py; do
     if [ -f "$TMP/$f" ]; then
         printf '  ✓ %-24s %8s 字节\n' "$f" "$(stat -c%s "$TMP/$f")"
     else
